@@ -3,19 +3,19 @@ Repo for building a chat based shopping experience for canadian made products.
 
 ## Scraping Products
 ```sh
-# scrape for testing and dump urls
 python scrape_products.py \
   --base https://www.roots.com \
   --out ./roots_out \
-  --url-regex='\.html$' \
-  --limit 500 \
-  --dump-urls
+  --use-browser \
+  --max-categories 10 \
+  --url-regex='\.html'
 
-# scraping with image download
+# scrape products and download images
 python scrape_products.py \
   --base https://www.roots.com \
   --out ./roots_out \
-  --url-regex='\.html$' \
-  --limit 500 \
+  --use-browser \
+  --max-categories 100 \
+  --url-regex='\.html' \
   --download-images
 ```

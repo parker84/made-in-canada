@@ -8,6 +8,7 @@ dependencies = [
     "bs4>=0.0.2",
     "colorlog>=6.10.1",
     "httpx>=0.28.1",
+    "playwright>=1.57.0",
     "tqdm>=4.67.1",
 ]
 

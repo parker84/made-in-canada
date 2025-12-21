@@ -36,6 +36,14 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 import xml.etree.ElementTree as ET
 
+# Playwright is optional - only imported if --use-browser is set
+playwright_available = False
+try:
+    from playwright.async_api import async_playwright
+    playwright_available = True
+except ImportError:
+    pass
+
 
 # Set up colored logging
 def setup_logger() -> logging.Logger:
@@ -236,6 +244,202 @@ async def collect_product_urls(
     return sorted(product_urls)
 
 
+async def discover_categories_with_browser(
+    base_url: str,
+    headless: bool = True,
+) -> List[str]:
+    """
+    Discover category page URLs from the homepage navigation.
+    """
+    if not playwright_available:
+        log.error("❌ Playwright not installed. Run: uv add playwright && playwright install firefox")
+        sys.exit(1)
+    
+    categories: Set[str] = set()
+    
+    async with async_playwright() as p:
+        browser = await p.firefox.launch(headless=headless)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+            viewport={"width": 1920, "height": 1080},
+            locale="en-CA",
+            timezone_id="America/Toronto",
+        )
+        page = await context.new_page()
+        
+        try:
+            await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(2)
+            
+            # Find category links (URLs ending with / that look like categories)
+            links = await page.evaluate("""
+                () => Array.from(document.querySelectorAll('a[href]'))
+                    .map(a => a.href)
+                    .filter(href => 
+                        href.endsWith('/') && 
+                        !href.includes('?') &&
+                        (href.includes('/women/') || 
+                         href.includes('/men/') || 
+                         href.includes('/kids/') ||
+                         href.includes('/leather/') ||
+                         href.includes('/sale/') ||
+                         href.includes('/made-in-canada') ||
+                         href.includes('/gender-free/') ||
+                         href.includes('/gifts/'))
+                    )
+            """)
+            
+            for link in links:
+                categories.add(link)
+            
+            log.info(f"🔍 Found {len(categories)} category pages")
+            
+        except Exception as e:
+            log.warning(f"⚠️  Failed to discover categories: {e}")
+        
+        await browser.close()
+    
+    return sorted(categories)
+
+
+async def crawl_category_with_browser(
+    category_urls: List[str],
+    url_regex: str = "",
+    max_load_more: int = 20,
+    headless: bool = True,
+    debug_screenshots: bool = False,
+    out_dir: str = "./out",
+) -> List[str]:
+    """
+    Use Playwright to crawl category pages, click Load More to get all products,
+    and extract product URLs.
+    """
+    if not playwright_available:
+        log.error("❌ Playwright not installed. Run: uv add playwright && playwright install firefox")
+        sys.exit(1)
+    
+    product_urls: Set[str] = set()
+    rx = re.compile(url_regex) if url_regex else None
+    
+    async with async_playwright() as p:
+        # Use Firefox (less likely to be blocked) with realistic settings
+        browser = await p.firefox.launch(headless=headless)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+            viewport={"width": 1920, "height": 1080},
+            locale="en-CA",
+            timezone_id="America/Toronto",
+        )
+        page = await context.new_page()
+        
+        for cat_url in tqdm(category_urls, desc="🌐 Crawling categories"):
+            try:
+                await page.goto(cat_url, wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(3)  # Wait for JS to kick in
+                
+                # Save debug screenshot if requested
+                if debug_screenshots:
+                    screenshot_dir = os.path.join(out_dir, "debug_screenshots")
+                    os.makedirs(screenshot_dir, exist_ok=True)
+                    safe_name = re.sub(r'[^a-zA-Z0-9]', '_', cat_url)[-100:]
+                    await page.screenshot(path=os.path.join(screenshot_dir, f"{safe_name}.png"), full_page=True)
+                
+                # Scroll to load all products (infinite scroll + "Load More" buttons)
+                last_height = 0
+                scroll_attempts = 0
+                max_scroll_attempts = 30
+                
+                while scroll_attempts < max_scroll_attempts:
+                    # Get current page height
+                    current_height = await page.evaluate("document.body.scrollHeight")
+                    
+                    # Scroll down in chunks
+                    await page.evaluate(f"window.scrollTo(0, {current_height})")
+                    await asyncio.sleep(1.5)  # Wait for lazy-loaded content
+                    
+                    # Try clicking "Load More" / "Show More" buttons
+                    load_more_selectors = [
+                        "button.show-more",
+                        ".show-more-products", 
+                        "button:has-text('Show More')",
+                        "button:has-text('Load More')",
+                        "button:has-text('View More')",
+                        ".load-more",
+                        "[class*='load-more']",
+                        "[class*='show-more']",
+                    ]
+                    for selector in load_more_selectors:
+                        try:
+                            btn = page.locator(selector).first
+                            if await btn.is_visible(timeout=300):
+                                await btn.scroll_into_view_if_needed()
+                                await btn.click()
+                                await asyncio.sleep(2)
+                                break
+                        except:
+                            continue
+                    
+                    # Check if page height changed (new content loaded)
+                    new_height = await page.evaluate("document.body.scrollHeight")
+                    if new_height == last_height:
+                        # No new content, try one more scroll to be sure
+                        scroll_attempts += 1
+                        if scroll_attempts >= 3:
+                            break
+                    else:
+                        scroll_attempts = 0  # Reset counter if we got new content
+                    
+                    last_height = new_height
+                
+                # Extract product links - look for product tiles specifically
+                links = await page.evaluate("""
+                    () => {
+                        const links = new Set();
+                        
+                        // Get ALL links on the page
+                        const allLinks = document.querySelectorAll('a[href]');
+                        
+                        allLinks.forEach(a => {
+                            const href = a.href;
+                            // Product URLs on Roots have pattern: -NUMBERS.html (may have query params after)
+                            if (/-\\d+\\.html/.test(href)) {
+                                // Strip query params to get clean product URL
+                                const cleanUrl = href.split('?')[0];
+                                links.add(cleanUrl);
+                            }
+                        });
+                        
+                        return Array.from(links);
+                    }
+                """)
+                
+                # Debug: show sample links found
+                if not links:
+                    all_html_links = await page.evaluate("""
+                        () => Array.from(document.querySelectorAll('a[href*=".html"]'))
+                            .slice(0, 10)
+                            .map(a => a.href)
+                    """)
+                    if all_html_links:
+                        log.warning(f"   ⚠️  No product links found. Sample .html links: {all_html_links[:3]}")
+                
+                before_count = len(product_urls)
+                for link in links:
+                    if rx is None or rx.search(link):
+                        product_urls.add(link)
+                
+                new_products = len(product_urls) - before_count
+                log.info(f"📄 {cat_url} → +{new_products} new products ({len(product_urls)} total)")
+                
+            except Exception as e:
+                log.warning(f"⚠️  Failed to crawl {cat_url}: {e}")
+        
+        await browser.close()
+    
+    log.info(f"✅ Discovered {len(product_urls)} product URLs via browser")
+    return sorted(product_urls)
+
+
 def extract_json_ld_products(html: str) -> List[Dict[str, Any]]:
     """
     Extract schema.org Product objects from JSON-LD blocks.
@@ -390,6 +594,11 @@ async def main():
     ap.add_argument("--download-images", action="store_true", help="Download images locally")
     ap.add_argument("--url-regex", default="", help="Regex to filter discovered URLs (applied after --pattern)")
     ap.add_argument("--dump-urls", action="store_true", help="Dump all discovered URLs to a file before filtering")
+    ap.add_argument("--use-browser", action="store_true", help="Use Playwright browser to crawl (for JS-heavy sites)")
+    ap.add_argument("--show-browser", action="store_true", help="Show browser window (for debugging, use with --use-browser)")
+    ap.add_argument("--category-urls", nargs="+", default=[], help="Category page URLs to crawl (with --use-browser)")
+    ap.add_argument("--max-categories", type=int, default=0, help="Max categories to crawl (0 = all)")
+    ap.add_argument("--debug-screenshots", action="store_true", help="Save screenshots of crawled pages for debugging")
     args = ap.parse_args()
 
     base = args.base.rstrip("/")
@@ -401,9 +610,46 @@ async def main():
 
     async with httpx.AsyncClient(headers=headers, limits=limits) as client:
         # Step 1: Discover URLs
-        log.info(f"🌐 [1/3] Discovering product URLs from {base} ...")
         step1_start = time.time()
-        urls = await collect_product_urls(client, base, args.pattern)
+        
+        if args.use_browser:
+            # Use Playwright to crawl category pages
+            category_urls = args.category_urls
+            
+            # Auto-discover categories if none specified
+            if not category_urls:
+                log.info(f"🔍 [1/3] Auto-discovering category pages from {base} ...")
+                category_urls = await discover_categories_with_browser(
+                    base,
+                    headless=not args.show_browser
+                )
+                if not category_urls:
+                    log.error("❌ No category pages found. Try specifying them with --category-urls")
+                    sys.exit(1)
+            
+            # Apply max-categories limit
+            if args.max_categories > 0:
+                category_urls = category_urls[:args.max_categories]
+            
+            log.info(f"🌐 Crawling {len(category_urls)} category pages with browser ...")
+            urls = await crawl_category_with_browser(
+                category_urls, 
+                args.url_regex,
+                headless=not args.show_browser,
+                debug_screenshots=args.debug_screenshots,
+                out_dir=out_dir,
+            )
+        else:
+            # Standard sitemap/link crawl
+            log.info(f"🌐 [1/3] Discovering product URLs from {base} ...")
+            urls = await collect_product_urls(client, base, args.pattern)
+            
+            # Apply regex filter if provided
+            if args.url_regex:
+                rx = re.compile(args.url_regex)
+                urls = [u for u in urls if rx.search(u)]
+                log.info(f"🔎 After regex filter '{args.url_regex}': {len(urls)} URLs remain")
+        
         step1_elapsed = time.time() - step1_start
         
         # Dump all URLs before filtering if requested
@@ -413,12 +659,6 @@ async def main():
                 for u in sorted(urls):
                     f.write(u + "\n")
             log.info(f"📝 Dumped {len(urls)} URLs to {dump_path}")
-        
-        # Apply regex filter if provided
-        if args.url_regex:
-            rx = re.compile(args.url_regex)
-            urls = [u for u in urls if rx.search(u)]
-            log.info(f"🔎 After regex filter '{args.url_regex}': {len(urls)} URLs remain")
         
         if args.limit and args.limit > 0:
             urls = urls[: args.limit]
@@ -443,7 +683,16 @@ async def main():
         # Step 2: Scrape product pages
         log.info(f"📦 [2/3] Scraping product pages (concurrency={args.concurrency}) ...")
         step2_start = time.time()
-        await asyncio.gather(*[scrape_one(u) for u in urls])
+        
+        # Use tqdm to show progress
+        pbar = tqdm(total=len(urls), desc="📦 Scraping products", unit="page")
+        
+        async def scrape_one_with_progress(u: str):
+            await scrape_one(u)
+            pbar.update(1)
+        
+        await asyncio.gather(*[scrape_one_with_progress(u) for u in urls])
+        pbar.close()
         step2_elapsed = time.time() - step2_start
 
         products.sort(key=lambda x: x.get("url", ""))
