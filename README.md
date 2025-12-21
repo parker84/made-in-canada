@@ -3,6 +3,7 @@ Repo for building a chat based shopping experience for canadian made products.
 
 ## Scraping Products
 ```sh
+source .venv/bin/activate
 python scrape_products.py \
   --base https://www.roots.com \
   --out ./roots_out \
@@ -20,4 +21,11 @@ python scrape_products.py \
   --url-regex='\.html' \
   --download-images \
   --use-postgres
+```
+
+## Running the App
+```sh
+source .venv/bin/activate
+export OPENAI_API_KEY=...
+streamlit run app.py
 ```

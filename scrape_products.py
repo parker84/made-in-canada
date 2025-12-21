@@ -55,6 +55,21 @@ try:
 except ImportError:
     pass
 
+# Cohere is optional - only imported if --use-postgres is set (for embeddings)
+cohere_available = False
+try:
+    import cohere
+    cohere_available = True
+except ImportError:
+    pass
+
+# Embedding Configuration
+EMBEDDING_MODEL = "embed-v4.0"
+EMBEDDING_DIMENSIONS = 1536
+
+# TODO: get this running for multiple brands (ex: airflow)
+# 1. on a schedule every day 
+
 
 # Set up colored logging
 def setup_logger() -> logging.Logger:
@@ -88,17 +103,29 @@ DB_CONFIG = {
 
 
 class DatabaseManager:
-    """Manages PostgreSQL database operations for products"""
+    """Manages PostgreSQL database operations for products with embeddings"""
     
     def __init__(self, db_config: Dict[str, str]):
         self.db_config = db_config
         self.conn = None
+        self.cohere_client = None
     
     async def connect(self):
-        """Connect to the database"""
+        """Connect to the database and initialize Cohere client"""
         if not psycopg_available:
-            log.error("❌ psycopg not installed. Run: uv add psycopg[binary]")
+            log.error("❌ psycopg not installed. Run: uv add 'psycopg[binary]'")
             sys.exit(1)
+        
+        if not cohere_available:
+            log.error("❌ cohere not installed. Run: uv add cohere")
+            sys.exit(1)
+        
+        # Initialize Cohere client for embeddings
+        cohere_api_key = config("COHERE_API_KEY", default="")
+        if not cohere_api_key:
+            log.error("❌ COHERE_API_KEY not set in environment")
+            sys.exit(1)
+        self.cohere_client = cohere.AsyncClientV2(api_key=cohere_api_key)
         
         log.info("🔌 Connecting to database...")
         start = time.time()
@@ -115,8 +142,11 @@ class DatabaseManager:
         start = time.time()
         
         async with self.conn.cursor() as cur:
-            # Create products table
-            await cur.execute("""
+            # Enable pgvector extension
+            await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            
+            # Create products table with embedding column
+            await cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS products (
                     id SERIAL PRIMARY KEY,
                     url TEXT UNIQUE NOT NULL,
@@ -129,6 +159,7 @@ class DatabaseManager:
                     availability TEXT,
                     images JSONB,
                     source_site TEXT,
+                    embedding vector({EMBEDDING_DIMENSIONS}),
                     scraped_at TIMESTAMP DEFAULT NOW(),
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
@@ -145,18 +176,55 @@ class DatabaseManager:
                 CREATE INDEX IF NOT EXISTS products_source_site_idx ON products (source_site)
             """)
             
+            # Create vector index for similarity search
+            await cur.execute("""
+                CREATE INDEX IF NOT EXISTS products_embedding_idx 
+                ON products 
+                USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100)
+            """)
+            
             await self.conn.commit()
         
         elapsed = time.time() - start
         log.info(f"✅ Schema initialized in {elapsed:.2f}s")
     
+    async def generate_embedding(self, text: str) -> List[float]:
+        """Generate embedding for text using Cohere"""
+        response = await self.cohere_client.embed(
+            texts=[text],
+            model=EMBEDDING_MODEL,
+            input_type="search_document",
+            embedding_types=["float"],
+            output_dimension=int(EMBEDDING_DIMENSIONS),
+        )
+        return response.embeddings.float_[0]
+    
+    def _create_product_text(self, product: Dict[str, Any]) -> str:
+        """Create searchable text from product data for embedding"""
+        parts = []
+        if product.get("name"):
+            parts.append(f"Product: {product['name']}")
+        if product.get("brand"):
+            parts.append(f"Brand: {product['brand']}")
+        if product.get("description"):
+            parts.append(f"Description: {product['description']}")
+        if product.get("price"):
+            parts.append(f"Price: {product['price']} {product.get('currency', '')}")
+        return " | ".join(parts) if parts else product.get("url", "")
+    
     async def save_product(self, product: Dict[str, Any], source_site: str) -> int:
-        """Save or update a product, return its ID"""
+        """Save or update a product with embedding, return its ID"""
+        # Generate embedding for the product
+        product_text = self._create_product_text(product)
+        embedding = await self.generate_embedding(product_text)
+        embedding_str = '[' + ','.join(str(x) for x in embedding) + ']'
+        
         async with self.conn.cursor() as cur:
             await cur.execute(
                 """
-                INSERT INTO products (url, name, brand, sku, description, price, currency, availability, images, source_site, scraped_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                INSERT INTO products (url, name, brand, sku, description, price, currency, availability, images, source_site, embedding, scraped_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, NOW(), NOW())
                 ON CONFLICT (url) DO UPDATE SET
                     name = EXCLUDED.name,
                     brand = EXCLUDED.brand,
@@ -166,6 +234,7 @@ class DatabaseManager:
                     currency = EXCLUDED.currency,
                     availability = EXCLUDED.availability,
                     images = EXCLUDED.images,
+                    embedding = EXCLUDED.embedding,
                     scraped_at = NOW(),
                     updated_at = NOW()
                 RETURNING id
@@ -181,6 +250,7 @@ class DatabaseManager:
                     product.get("availability"),
                     Json(product.get("images", [])),
                     source_site,
+                    embedding_str,
                 ),
             )
             result = await cur.fetchone()
