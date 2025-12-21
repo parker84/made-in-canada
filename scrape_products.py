@@ -26,13 +26,15 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 import colorlog
 import httpx
 from bs4 import BeautifulSoup
+from decouple import config
 from tqdm import tqdm
 import xml.etree.ElementTree as ET
 
@@ -41,6 +43,15 @@ playwright_available = False
 try:
     from playwright.async_api import async_playwright
     playwright_available = True
+except ImportError:
+    pass
+
+# Psycopg is optional - only imported if --use-postgres is set
+psycopg_available = False
+try:
+    import psycopg
+    from psycopg.types.json import Json
+    psycopg_available = True
 except ImportError:
     pass
 
@@ -66,6 +77,145 @@ def setup_logger() -> logging.Logger:
 log = setup_logger()
 
 DEFAULT_UA = "Mozilla/5.0 (compatible; ProductScraper/1.0; +https://example.com/bot)"
+
+# Database Configuration (from environment variables)
+DB_CONFIG = {
+    "host": config("POSTGRES_HOST"),
+    "dbname": config("POSTGRES_DB"),
+    "user": config("POSTGRES_USER"),
+    "password": config("POSTGRES_PASSWORD", default=""),
+}
+
+
+class DatabaseManager:
+    """Manages PostgreSQL database operations for products"""
+    
+    def __init__(self, db_config: Dict[str, str]):
+        self.db_config = db_config
+        self.conn = None
+    
+    async def connect(self):
+        """Connect to the database"""
+        if not psycopg_available:
+            log.error("❌ psycopg not installed. Run: uv add psycopg[binary]")
+            sys.exit(1)
+        
+        log.info("🔌 Connecting to database...")
+        start = time.time()
+        
+        conn_string = f"host={self.db_config['host']} dbname={self.db_config['dbname']} user={self.db_config['user']} password={self.db_config['password']}"
+        self.conn = await psycopg.AsyncConnection.connect(conn_string)
+        
+        elapsed = time.time() - start
+        log.info(f"✅ Database connected in {elapsed:.2f}s")
+    
+    async def initialize_schema(self):
+        """Create necessary tables if they don't exist"""
+        log.info("📋 Initializing database schema...")
+        start = time.time()
+        
+        async with self.conn.cursor() as cur:
+            # Create products table
+            await cur.execute("""
+                CREATE TABLE IF NOT EXISTS products (
+                    id SERIAL PRIMARY KEY,
+                    url TEXT UNIQUE NOT NULL,
+                    name TEXT,
+                    brand TEXT,
+                    sku TEXT,
+                    description TEXT,
+                    price TEXT,
+                    currency TEXT,
+                    availability TEXT,
+                    images JSONB,
+                    source_site TEXT,
+                    scraped_at TIMESTAMP DEFAULT NOW(),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            # Create index on URL for fast lookups
+            await cur.execute("""
+                CREATE INDEX IF NOT EXISTS products_url_idx ON products (url)
+            """)
+            
+            # Create index on source_site for filtering
+            await cur.execute("""
+                CREATE INDEX IF NOT EXISTS products_source_site_idx ON products (source_site)
+            """)
+            
+            await self.conn.commit()
+        
+        elapsed = time.time() - start
+        log.info(f"✅ Schema initialized in {elapsed:.2f}s")
+    
+    async def save_product(self, product: Dict[str, Any], source_site: str) -> int:
+        """Save or update a product, return its ID"""
+        async with self.conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO products (url, name, brand, sku, description, price, currency, availability, images, source_site, scraped_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (url) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    brand = EXCLUDED.brand,
+                    sku = EXCLUDED.sku,
+                    description = EXCLUDED.description,
+                    price = EXCLUDED.price,
+                    currency = EXCLUDED.currency,
+                    availability = EXCLUDED.availability,
+                    images = EXCLUDED.images,
+                    scraped_at = NOW(),
+                    updated_at = NOW()
+                RETURNING id
+                """,
+                (
+                    product["url"],
+                    product.get("name"),
+                    product.get("brand"),
+                    product.get("sku"),
+                    product.get("description"),
+                    product.get("price"),
+                    product.get("currency"),
+                    product.get("availability"),
+                    Json(product.get("images", [])),
+                    source_site,
+                ),
+            )
+            result = await cur.fetchone()
+            await self.conn.commit()
+            return result[0]
+    
+    async def save_products_batch(self, products: List[Dict[str, Any]], source_site: str) -> int:
+        """Save multiple products in a batch, return count saved"""
+        saved = 0
+        for product in products:
+            try:
+                await self.save_product(product, source_site)
+                saved += 1
+            except Exception as e:
+                log.warning(f"⚠️  Failed to save product {product.get('url')}: {e}")
+        return saved
+    
+    async def get_product_count(self, source_site: str = None) -> int:
+        """Get count of products, optionally filtered by source"""
+        async with self.conn.cursor() as cur:
+            if source_site:
+                await cur.execute(
+                    "SELECT COUNT(*) FROM products WHERE source_site = %s",
+                    (source_site,)
+                )
+            else:
+                await cur.execute("SELECT COUNT(*) FROM products")
+            result = await cur.fetchone()
+            return result[0]
+    
+    async def close(self):
+        """Close database connection"""
+        if self.conn:
+            await self.conn.close()
+            log.info("🔌 Database connection closed")
 
 
 @dataclass
@@ -599,6 +749,7 @@ async def main():
     ap.add_argument("--category-urls", nargs="+", default=[], help="Category page URLs to crawl (with --use-browser)")
     ap.add_argument("--max-categories", type=int, default=0, help="Max categories to crawl (0 = all)")
     ap.add_argument("--debug-screenshots", action="store_true", help="Save screenshots of crawled pages for debugging")
+    ap.add_argument("--use-postgres", action="store_true", help="Save products to PostgreSQL instead of JSON file")
     args = ap.parse_args()
 
     base = args.base.rstrip("/")
@@ -696,11 +847,24 @@ async def main():
         step2_elapsed = time.time() - step2_start
 
         products.sort(key=lambda x: x.get("url", ""))
-        out_json = os.path.join(out_dir, "products.json")
-        with open(out_json, "w", encoding="utf-8") as f:
-            json.dump(products, f, ensure_ascii=False, indent=2)
-
-        log.info(f"💾 Saved {len(products)} products -> {out_json} ⏱️  {step2_elapsed:.1f}s")
+        
+        # Save to PostgreSQL or JSON file
+        if args.use_postgres:
+            db = DatabaseManager(DB_CONFIG)
+            await db.connect()
+            await db.initialize_schema()
+            
+            source_site = urlparse(base).netloc
+            saved_count = await db.save_products_batch(products, source_site)
+            total_count = await db.get_product_count(source_site)
+            await db.close()
+            
+            log.info(f"💾 Saved {saved_count} products to PostgreSQL ({total_count} total for {source_site}) ⏱️  {step2_elapsed:.1f}s")
+        else:
+            out_json = os.path.join(out_dir, "products.json")
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(products, f, ensure_ascii=False, indent=2)
+            log.info(f"💾 Saved {len(products)} products -> {out_json} ⏱️  {step2_elapsed:.1f}s")
 
         if args.download_images:
             # Step 3: Download images

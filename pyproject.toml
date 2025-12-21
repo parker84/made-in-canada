@@ -9,6 +9,8 @@ dependencies = [
     "colorlog>=6.10.1",
     "httpx>=0.28.1",
     "playwright>=1.57.0",
+    "psycopg[binary]>=3.3.2",
+    "python-decouple>=3.8",
     "tqdm>=4.67.1",
 ]
 
