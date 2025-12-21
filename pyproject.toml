@@ -1,0 +1,20 @@
+[project]
+name = "made-in-canada"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "bs4>=0.0.2",
+    "colorlog>=6.10.1",
+    "httpx>=0.28.1",
+    "playwright>=1.57.0",
+    "psycopg[binary]>=3.3.2",
+    "python-decouple>=3.8",
+    "tqdm>=4.67.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipdb>=0.13.13",
+]
