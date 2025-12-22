@@ -44,6 +44,36 @@ def get_thinking_message() -> str:
     return choice(messages)
 
 
+def login_screen():
+    """Display the login screen"""
+    st.header("🍁 Made in Canada")
+    st.write("Find Canadian products and support local businesses.")
+    st.write("Please log in to continue.")
+    if st.button("🔐 Log in with Google", type="primary"):
+        st.login("google")
+        st.stop()
+    st.stop()
+
+
+def is_logged_in() -> bool:
+    """Check if user is logged in"""
+    return hasattr(st, 'user') and hasattr(st.user, 'is_logged_in') and st.user.is_logged_in
+
+
+def get_user_first_name() -> str:
+    """Get the user's first name or 'there' as fallback"""
+    if hasattr(st, 'user') and hasattr(st.user, 'name') and st.user.name:
+        return st.user.name.split(' ')[0]
+    return "there"
+
+
+def get_user_email() -> str:
+    """Get the user's email or fallback"""
+    if hasattr(st, 'user') and hasattr(st.user, 'email') and st.user.email:
+        return st.user.email
+    return "anonymous_user"
+
+
 # Set page config
 st.set_page_config(
     page_title="Made in Canada",
@@ -105,32 +135,37 @@ async def parse_stream(stream: AsyncIterator[RunOutput]) -> AsyncGenerator[tuple
                     last_event = "analyzing"
 
 
-# Sidebar
+# Sidebar (always visible)
 with st.sidebar:
-
-    # TODO:
-    # 1. previous chats in the sidebar
-    # 2. google auth login
-    
     st.link_button("❤️ Feedback", "https://forms.gle/5dWaY279oFsfwhTw9")
     st.link_button("📧 Contact us", "mailto:parkerbrydon@gmail.com")
+
+# Check login status
+if not is_logged_in():
+    login_screen()
+
+# User is logged in - show main app
+with st.sidebar:
     st.markdown("---")
     if st.button("🔄 Clear Chat"):
         st.session_state.messages = []
         st.rerun()
+    st.button("🔐 Log out", on_click=st.logout, type="secondary")
 
 # Main content
 st.title("🍁 Made in Canada")
 st.caption("Find Canadian products and support Canadian businesses")
 
 # Welcome message
+first_name = get_user_first_name()
 if not st.session_state.messages:
-    # TODO: let's make the intro message better
+    intro_messages = [
+        f"👋 Hey {first_name}! I can help you find products that are **Made in Canada** 🇨🇦",
+        f"👋 Welcome {first_name}! Let's find some great Canadian products together 🍁",
+        f"👋 Hi {first_name}! Ready to discover Canadian-made products? 🇨🇦",
+    ]
+    st.markdown(choice(intro_messages))
     st.markdown("""
-    👋 **Welcome!** I can help you find products that are:
-    - **Made in Canada** 🇨🇦
-    - **From Canadian-owned businesses** 🍁
-    
     Try asking things like:
     - "Find me a warm winter jacket 🧥"
     - "Looking for Canadian-made leather goods 👜"
@@ -164,7 +199,7 @@ async def run_agent(prompt: str):
         prompt,
         stream=True,
         stream_events=True,
-        user_id="streamlit_user", # TODO: make this specific to the user with email login
+        user_id=get_user_email(),
         session_id=st.session_state.session_id,
     )
 

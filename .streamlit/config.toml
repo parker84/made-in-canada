@@ -1,0 +1,15 @@
+
+[theme]
+base="light"
+primaryColor="#ff3131"               # Bold maple red
+backgroundColor="#fafcfe"            # Almost white, cool and clean (like snow in sunlight ❄️)
+secondaryBackgroundColor="#edf1f7"   # Very soft contrast — clean but not flat
+textColor="#111111"                  # Strong contrast, not harsh
+font="monospace"                     # Still keeping the hacker/synth feel
+
+[theme.dark]
+primaryColor="#ff3131"               # Keep the maple red — it glows beautifully on dark UIs
+backgroundColor="#0c0f13"            # Deep charcoal with a blue tint (not pure black)
+secondaryBackgroundColor="#171b21"   # Slightly lighter — perfect for cards, widgets
+textColor="#f4f6fa"                  # Soft white; avoids the harsh #ffffff
+font="monospace"                     # Maintains your hacker/synth coding vibe

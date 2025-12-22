@@ -212,3 +212,6 @@ out/
 discovered_urls.txt
 products.json
 images/
+
+# Streamlit secrets
+.streamlit/secrets.toml
