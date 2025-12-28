@@ -31,7 +31,6 @@ TOOL_DISPLAY_NAMES = {
 
 def get_thinking_message() -> str:
     """Get a random thinking message"""
-    # TODO: let's make these more fun
     messages = [
         "Searching for Canadian products... 🍁",
         "Looking through the catalogue... 📦",
@@ -174,7 +173,7 @@ if not st.session_state.messages:
 
 # Display chat messages
 for message in st.session_state.messages:
-    avatar = "🍁" if message["role"] == "assistant" else "👤"
+    avatar = "🍁" if message["role"] == "assistant" else "🦫"
     with st.chat_message(message["role"], avatar=avatar):
         st.markdown(message["content"])
 
@@ -182,7 +181,6 @@ for message in st.session_state.messages:
 @st.cache_data
 def get_placeholder():
     """Get a random placeholder for the chat input"""
-    # TODO: let's make these better
     return choice([
         "Find me a warm Canadian-made winter jacket 🧥",
         "Looking for cozy sweaters from Roots 🍁",

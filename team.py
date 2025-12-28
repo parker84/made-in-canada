@@ -35,6 +35,13 @@ AGENT_MODEL_ID = config("AGENT_MODEL_ID", default="gpt-5-nano")
 # Knowledge Base Configuration
 EMBEDDING_MODEL = "embed-v4.0"
 EMBEDDING_DIMENSIONS = 1536
+RERANK_MODEL = "rerank-v3.5"
+INITIAL_SEARCH_LIMIT = 50  # Fetch more results for re-ranking
+RERANK_TOP_N = 10  # Return top 10 after re-ranking
+
+# Lengths
+MAX_DESCRIPTION_LENGTH = 1000
+MAX_MARKDOWN_LENGTH = 1000
 
 # Database Configuration
 DB_CONFIG = {
@@ -73,12 +80,62 @@ async def generate_embedding(text: str) -> List[float]:
     return response.embeddings.float_[0]
 
 
-async def search_products(query: str, limit: int = 10) -> str:
+async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N) -> list:
+    """Re-rank search results using Cohere's rerank model.
+    
+    Args:
+        query: The user's search query
+        results: List of tuples from database (name, brand, description, price, currency, url, source_site, similarity, markdown)
+        top_n: Number of top results to return after re-ranking
+        
+    Returns:
+        Re-ranked list of results (same format as input)
+    """
+    if not results:
+        return results
+    
+    # Create documents for re-ranking (combine name, brand, description)
+    documents = []
+    for name, brand, description, price, currency, url, source_site, similarity, markdown in results:
+        doc_text = f"Product Name: {name or ''} | Brand Name: {brand or ''}"
+        if description:
+            doc_text += f" | Description: {description[:MAX_DESCRIPTION_LENGTH] if description else ''}"
+        if markdown:
+            doc_text += f" | Markdown Content: {markdown[:MAX_MARKDOWN_LENGTH] if markdown else ''}"
+        if price:
+            doc_text += f" | Price: {price} {currency or ''}"
+        logger.debug(f"Document text: {doc_text}")
+        documents.append(doc_text)
+    
+    try:
+        cohere_client = cohere.AsyncClientV2(api_key=config("COHERE_API_KEY"))
+        rerank_response = await cohere_client.rerank(
+            model=RERANK_MODEL,
+            query=query,
+            documents=documents,
+            top_n=min(top_n, len(results)),
+        )
+        
+        # Re-order results based on rerank scores
+        reranked_results = []
+        for result in rerank_response.results:
+            original_idx = result.index
+            reranked_results.append(results[original_idx])
+        
+        logger.info(f"🔄 Re-ranked {len(results)} results → top {len(reranked_results)}")
+        return reranked_results
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Re-ranking failed, using original order: {e}")
+        return results[:top_n]
+
+
+async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
     """Search the product knowledge base for similar products.
     
     Args:
         query: The user's query to search for
-        limit: Number of similar results to return (default: 10)
+        limit: Number of results to return after re-ranking (default: 10)
         
     Returns:
         A formatted string with relevant products
@@ -93,7 +150,7 @@ async def search_products(query: str, limit: int = 10) -> str:
         conn = await psycopg.AsyncConnection.connect(conn_string)
         
         async with conn.cursor() as cur:
-            # Search for similar products using vector similarity
+            # Fetch more results initially for re-ranking
             sql_query = """
                 SELECT 
                     name,
@@ -103,34 +160,43 @@ async def search_products(query: str, limit: int = 10) -> str:
                     currency,
                     url,
                     source_site,
-                    1 - (embedding <=> %s::vector) AS similarity
+                    1 - (embedding <=> %s::vector) AS similarity,
+                    markdown as markdown_content
                 FROM products
                 WHERE embedding IS NOT NULL
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
             """
-            await cur.execute(sql_query, (embedding_str, embedding_str, limit))
+            await cur.execute(sql_query, (embedding_str, embedding_str, INITIAL_SEARCH_LIMIT))
             results = await cur.fetchall()
             
             if results:
                 logger.info(f"🔍 Found {len(results)} products (top similarity: {results[0][7]:.2%})")
-        
+            else:
+                logger.warning(f"No products found in the knowledge base. Try a different search query than '{query}'")
         await conn.close()
         
         if not results:
             return "No products found in the knowledge base. Try a different search query."
         
+        # Cohere Re-ranking - filter to top N most relevant
+        results = await rerank_results(query, results, top_n=limit)
+        
+        
         # Format results
         formatted_results = [f"Found {len(results)} products matching your query:\n"]
-        for i, (name, brand, description, price, currency, url, source_site, similarity) in enumerate(results, 1):
+        for i, (name, brand, description, price, currency, url, source_site, similarity, markdown_content) in enumerate(results, 1):
             formatted_results.append(f"### {i}. {name or 'Unknown Product'}")
             if brand:
                 formatted_results.append(f"**Brand:** {brand}")
             if price:
                 formatted_results.append(f"**Price:** {price} {currency or ''}")
             if description:
-                desc_short = description[:200] + "..." if len(description) > 200 else description
+                desc_short = description[:MAX_DESCRIPTION_LENGTH] + "..." if len(description) > MAX_DESCRIPTION_LENGTH else description
                 formatted_results.append(f"**Description:** {desc_short}")
+            if markdown_content:
+                markdown_short = markdown_content[:MAX_MARKDOWN_LENGTH] + "..." if len(markdown_content) > MAX_MARKDOWN_LENGTH else markdown_content
+                formatted_results.append(f"**Markdown:** {markdown_short}")
             formatted_results.append(f"**Link:** [{url}]({url})")
             formatted_results.append(f"**Source:** {source_site} | **Match:** {similarity:.1%}")
             formatted_results.append("")
@@ -241,5 +307,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    search_products_sync("hoodie test")
+
     asyncio.run(main())
 

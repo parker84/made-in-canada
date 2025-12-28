@@ -67,6 +67,38 @@ except ImportError:
 EMBEDDING_MODEL = "embed-v4.0"
 EMBEDDING_DIMENSIONS = 1536
 
+# Sleep time on error
+SLEEP_TIME_ON_ERROR = 60*20 # 20 minutes
+WAIT_TIME_BETWEEN_REQUESTS = 10 # 10 seconds
+
+# Pure.md API for markdown conversion
+PUREMD_API_URL = "https://pure.md"
+PUREMD_API_KEY = config("PUREMD_API_KEY", default=None)
+PUREMD_HEADERS = {"x-puremd-api-token": PUREMD_API_KEY} if PUREMD_API_KEY else {}
+
+# Store type configurations - patterns for different ecommerce platforms
+STORE_CONFIGS = {
+    "shopify": {
+        "category_patterns": ["/collections/"],
+        "product_pattern": r"/products/[^/]+$",
+        "product_js": "href.includes('/products/')",
+    },
+    "roots": {
+        "category_patterns": ["/women/", "/men/", "/kids/", "/leather/", "/sale/", "/gifts/"],
+        "product_pattern": r"-\d+\.html",
+        "product_js": "/-\\d+\\.html/.test(href)",
+    },
+    "generic": {
+        "category_patterns": [
+            "/collections/", "/category/", "/categories/", "/shop/",
+            "/women/", "/men/", "/kids/", "/sale/", "/new/",
+            "/accessories/", "/clothing/", "/shoes/", "/bags/",
+        ],
+        "product_pattern": r"(/products/|/product/|-\d+\.html|/p/)",
+        "product_js": "href.includes('/products/') || href.includes('/product/') || /-\\d+\\.html/.test(href) || /\\/p\\/[^/]+/.test(href)",
+    },
+}
+
 # TODO: get this running for multiple brands (ex: airflow)
 # 1. on a schedule every day 
 
@@ -158,12 +190,24 @@ class DatabaseManager:
                     currency TEXT,
                     availability TEXT,
                     images JSONB,
+                    html TEXT,
+                    markdown TEXT,
                     source_site TEXT,
                     embedding vector({EMBEDDING_DIMENSIONS}),
                     scraped_at TIMESTAMP DEFAULT NOW(),
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
+            """)
+            
+            # Add html column if it doesn't exist (for existing tables)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS html TEXT
+            """)
+            
+            # Add markdown column if it doesn't exist (for existing tables)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS markdown TEXT
             """)
             
             # Create index on URL for fast lookups
@@ -205,13 +249,15 @@ class DatabaseManager:
         parts = []
         if product.get("name"):
             parts.append(f"Product: {product['name']}")
-        if product.get("brand"):
-            parts.append(f"Brand: {product['brand']}")
+        # if product.get("brand"):
+        #     parts.append(f"Brand: {product['brand']}")
         if product.get("description"):
             parts.append(f"Description: {product['description']}")
-        if product.get("price"):
-            parts.append(f"Price: {product['price']} {product.get('currency', '')}")
-        return " | ".join(parts) if parts else product.get("url", "")
+        # if product.get("price"):
+        #     parts.append(f"Price: {product['price']} {product.get('currency', '')}")
+        product_text = " | ".join(parts) if parts else product.get("url", "")
+        log.info(f"Product text: {product_text}")
+        return product_text
     
     async def save_product(self, product: Dict[str, Any], source_site: str) -> int:
         """Save or update a product with embedding, return its ID"""
@@ -223,8 +269,8 @@ class DatabaseManager:
         async with self.conn.cursor() as cur:
             await cur.execute(
                 """
-                INSERT INTO products (url, name, brand, sku, description, price, currency, availability, images, source_site, embedding, scraped_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, NOW(), NOW())
+                INSERT INTO products (url, name, brand, sku, description, price, currency, availability, images, html, markdown, source_site, embedding, scraped_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, NOW(), NOW())
                 ON CONFLICT (url) DO UPDATE SET
                     name = EXCLUDED.name,
                     brand = EXCLUDED.brand,
@@ -234,6 +280,8 @@ class DatabaseManager:
                     currency = EXCLUDED.currency,
                     availability = EXCLUDED.availability,
                     images = EXCLUDED.images,
+                    html = EXCLUDED.html,
+                    markdown = EXCLUDED.markdown,
                     embedding = EXCLUDED.embedding,
                     scraped_at = NOW(),
                     updated_at = NOW()
@@ -249,6 +297,8 @@ class DatabaseManager:
                     product.get("currency"),
                     product.get("availability"),
                     Json(product.get("images", [])),
+                    product.get("html"),
+                    product.get("markdown"),
                     source_site,
                     embedding_str,
                 ),
@@ -258,14 +308,32 @@ class DatabaseManager:
             return result[0]
     
     async def save_products_batch(self, products: List[Dict[str, Any]], source_site: str) -> int:
-        """Save multiple products in a batch, return count saved"""
+        """Save multiple products in a batch with rate limiting for embedding API"""
         saved = 0
-        for product in products:
+        failed = 0
+        
+        for i, product in enumerate(products):
             try:
                 await self.save_product(product, source_site)
                 saved += 1
+                
+                # Rate limit: pause every 20 products to avoid API limits
+                if saved % 20 == 0:
+                    log.info(f"💾 Progress: {saved}/{len(products)} saved...")
+                    await asyncio.sleep(1)  # Brief pause to respect rate limits
+                    
             except Exception as e:
-                log.warning(f"⚠️  Failed to save product {product.get('url')}: {e}")
+                failed += 1
+                log.warning(f"⚠️  Failed to save product {product.get('url', 'unknown')[:50]}: {str(e)[:100]}")
+                
+                # If we're getting too many failures, add a longer pause
+                if failed > 5 and failed % 5 == 0:
+                    log.warning(f"⚠️  Multiple failures ({failed}), pausing 5s to respect rate limits...")
+                    await asyncio.sleep(5)
+        
+        if failed > 0:
+            log.warning(f"⚠️  {failed} products failed to save (likely rate limiting or missing data)")
+        
         return saved
     
     async def get_product_count(self, source_site: str = None) -> int:
@@ -299,6 +367,8 @@ class Product:
     currency: Optional[str] = None
     availability: Optional[str] = None
     images: List[str] = None
+    html: Optional[str] = None  # Raw HTML of the product page
+    markdown: Optional[str] = None  # Markdown version of the product page
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -311,6 +381,8 @@ class Product:
             "currency": self.currency,
             "availability": self.availability,
             "images": self.images or [],
+            "html": self.html,
+            "markdown": self.markdown,
         }
 
 
@@ -323,7 +395,23 @@ async def fetch_text(client: httpx.AsyncClient, url: str, timeout: float = 30) -
         r = await client.get(url, timeout=timeout, follow_redirects=True)
         r.raise_for_status()
         return r.text
-    except Exception:
+    except Exception as e:
+        log.error(f"❌ Error fetching {url}: {e}")
+        return None
+
+
+async def fetch_markdown(client: httpx.AsyncClient, url: str, timeout: float = 30) -> Optional[str]:
+    """Fetch markdown version of a URL using pure.md API"""
+    try:
+        puremd_url = f"{PUREMD_API_URL}/{url}"
+        r = await client.get(puremd_url, timeout=timeout, headers=PUREMD_HEADERS)
+        if r.status_code == 200:
+            return r.text
+        else:
+            log.debug(f"⚠️  pure.md returned {r.status_code} for {url}")
+            return None
+    except Exception as e:
+        log.debug(f"⚠️  Error fetching markdown for {url}: {e}")
         return None
 
 
@@ -466,16 +554,24 @@ async def collect_product_urls(
 
 async def discover_categories_with_browser(
     base_url: str,
+    category_patterns: List[str],
     headless: bool = True,
 ) -> List[str]:
     """
     Discover category page URLs from the homepage navigation.
+    
+    Args:
+        base_url: The homepage URL
+        category_patterns: List of URL patterns that indicate category pages (e.g. ["/collections/", "/women/"])
+        headless: Whether to run browser in headless mode
     """
     if not playwright_available:
         log.error("❌ Playwright not installed. Run: uv add playwright && playwright install firefox")
         sys.exit(1)
     
     categories: Set[str] = set()
+    # Convert patterns to JSON for JavaScript
+    patterns_json = json.dumps(category_patterns)
     
     async with async_playwright() as p:
         browser = await p.firefox.launch(headless=headless)
@@ -491,22 +587,33 @@ async def discover_categories_with_browser(
             await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(2)
             
-            # Find category links (URLs ending with / that look like categories)
-            links = await page.evaluate("""
-                () => Array.from(document.querySelectorAll('a[href]'))
-                    .map(a => a.href)
-                    .filter(href => 
-                        href.endsWith('/') && 
-                        !href.includes('?') &&
-                        (href.includes('/women/') || 
-                         href.includes('/men/') || 
-                         href.includes('/kids/') ||
-                         href.includes('/leather/') ||
-                         href.includes('/sale/') ||
-                         href.includes('/made-in-canada') ||
-                         href.includes('/gender-free/') ||
-                         href.includes('/gifts/'))
-                    )
+            # Find category links using provided patterns
+            links = await page.evaluate(f"""
+                () => {{
+                    const categoryPatterns = {patterns_json};
+                    const links = new Set();
+                    const allLinks = Array.from(document.querySelectorAll('a[href]'));
+                    
+                    for (const a of allLinks) {{
+                        const href = a.href;
+                        
+                        // Skip external links, anchors, query params
+                        if (!href.startsWith(window.location.origin)) continue;
+                        if (href.includes('#')) continue;
+                        if (href.includes('?')) continue;
+                        if (href === window.location.origin + '/') continue;
+                        
+                        // Check if URL matches any category pattern
+                        const hrefLower = href.toLowerCase();
+                        if (categoryPatterns.some(p => hrefLower.includes(p.toLowerCase()))) {{
+                            // For /collections/, exclude product pages
+                            if (href.includes('/collections/') && href.includes('/products/')) continue;
+                            links.add(href);
+                        }}
+                    }}
+                    
+                    return Array.from(links);
+                }}
             """)
             
             for link in links:
@@ -524,6 +631,7 @@ async def discover_categories_with_browser(
 
 async def crawl_category_with_browser(
     category_urls: List[str],
+    product_js_filter: str,
     url_regex: str = "",
     max_load_more: int = 20,
     headless: bool = True,
@@ -533,6 +641,15 @@ async def crawl_category_with_browser(
     """
     Use Playwright to crawl category pages, click Load More to get all products,
     and extract product URLs.
+    
+    Args:
+        category_urls: List of category page URLs to crawl
+        product_js_filter: JavaScript expression to identify product links (e.g. "href.includes('/products/')")
+        url_regex: Optional regex to further filter URLs
+        max_load_more: Max scroll attempts
+        headless: Run browser headlessly
+        debug_screenshots: Save debug screenshots
+        out_dir: Output directory
     """
     if not playwright_available:
         log.error("❌ Playwright not installed. Run: uv add playwright && playwright install firefox")
@@ -611,37 +728,43 @@ async def crawl_category_with_browser(
                     
                     last_height = new_height
                 
-                # Extract product links - look for product tiles specifically
-                links = await page.evaluate("""
-                    () => {
+                # Extract product links using the configured filter
+                links = await page.evaluate(f"""
+                    () => {{
                         const links = new Set();
-                        
-                        // Get ALL links on the page
                         const allLinks = document.querySelectorAll('a[href]');
                         
-                        allLinks.forEach(a => {
+                        allLinks.forEach(a => {{
                             const href = a.href;
-                            // Product URLs on Roots have pattern: -NUMBERS.html (may have query params after)
-                            if (/-\\d+\\.html/.test(href)) {
-                                // Strip query params to get clean product URL
+                            
+                            // Apply the store-specific product filter
+                            if ({product_js_filter}) {{
                                 const cleanUrl = href.split('?')[0];
                                 links.add(cleanUrl);
-                            }
-                        });
+                            }}
+                        }});
                         
                         return Array.from(links);
-                    }
+                    }}
                 """)
                 
                 # Debug: show sample links found
                 if not links:
-                    all_html_links = await page.evaluate("""
-                        () => Array.from(document.querySelectorAll('a[href*=".html"]'))
-                            .slice(0, 10)
+                    # Get sample links to help debug
+                    sample_links = await page.evaluate("""
+                        () => Array.from(document.querySelectorAll('a[href]'))
                             .map(a => a.href)
+                            .filter(href => href.startsWith(window.location.origin))
+                            .slice(0, 20)
                     """)
-                    if all_html_links:
-                        log.warning(f"   ⚠️  No product links found. Sample .html links: {all_html_links[:3]}")
+                    log.warning(f"   ⚠️  No product links found on this page.")
+                    if sample_links:
+                        # Look for anything that might be a product
+                        product_like = [l for l in sample_links if '/product' in l.lower()]
+                        if product_like:
+                            log.warning(f"   🔍 Found product-like URLs: {product_like[:3]}")
+                        else:
+                            log.debug(f"   🔍 Sample links: {sample_links[:5]}")
                 
                 before_count = len(product_urls)
                 for link in links:
@@ -724,9 +847,9 @@ def pick_best_product_schema(schemas: List[Dict[str, Any]]) -> Optional[Dict[str
     return scored[0][1]
 
 
-def parse_product_from_html(url: str, html: str) -> Product:
+def parse_product_from_html(url: str, html: str, markdown: Optional[str] = None) -> Product:
     soup = BeautifulSoup(html, "html.parser")
-    p = Product(url=url, images=[])
+    p = Product(url=url, images=[], html=html, markdown=markdown)
 
     schemas = extract_json_ld_products(html)
     schema = pick_best_product_schema(schemas)
@@ -810,7 +933,6 @@ async def main():
     ap.add_argument("--pattern", default="/", help="URL substring to filter (default: '/' matches all)")
     ap.add_argument("--limit", type=int, default=0, help="Limit number of products (0 = no limit)")
     ap.add_argument("--concurrency", type=int, default=6, help="Concurrent requests")
-    ap.add_argument("--delay", type=float, default=0.3, help="Delay between requests per worker (seconds)")
     ap.add_argument("--download-images", action="store_true", help="Download images locally")
     ap.add_argument("--url-regex", default="", help="Regex to filter discovered URLs (applied after --pattern)")
     ap.add_argument("--dump-urls", action="store_true", help="Dump all discovered URLs to a file before filtering")
@@ -820,7 +942,12 @@ async def main():
     ap.add_argument("--max-categories", type=int, default=0, help="Max categories to crawl (0 = all)")
     ap.add_argument("--debug-screenshots", action="store_true", help="Save screenshots of crawled pages for debugging")
     ap.add_argument("--use-postgres", action="store_true", help="Save products to PostgreSQL instead of JSON file")
+    ap.add_argument("--store-type", choices=["shopify", "roots", "generic"], default="generic",
+                    help="Store type for auto-detection patterns (default: generic)")
     args = ap.parse_args()
+    
+    # Get store configuration
+    store_config = STORE_CONFIGS[args.store_type]
 
     base = args.base.rstrip("/")
     out_dir = args.out
@@ -839,13 +966,14 @@ async def main():
             
             # Auto-discover categories if none specified
             if not category_urls:
-                log.info(f"🔍 [1/3] Auto-discovering category pages from {base} ...")
+                log.info(f"🔍 [1/3] Auto-discovering category pages from {base} (store type: {args.store_type}) ...")
                 category_urls = await discover_categories_with_browser(
                     base,
+                    category_patterns=store_config["category_patterns"],
                     headless=not args.show_browser
                 )
                 if not category_urls:
-                    log.error("❌ No category pages found. Try specifying them with --category-urls")
+                    log.error("❌ No category pages found. Try specifying them with --category-urls or a different --store-type")
                     sys.exit(1)
             
             # Apply max-categories limit
@@ -854,8 +982,9 @@ async def main():
             
             log.info(f"🌐 Crawling {len(category_urls)} category pages with browser ...")
             urls = await crawl_category_with_browser(
-                category_urls, 
-                args.url_regex,
+                category_urls,
+                product_js_filter=store_config["product_js"],
+                url_regex=args.url_regex,
                 headless=not args.show_browser,
                 debug_screenshots=args.debug_screenshots,
                 out_dir=out_dir,
@@ -894,11 +1023,28 @@ async def main():
 
         async def scrape_one(u: str):
             async with sem:
-                html = await fetch_text(client, u)
-                await asyncio.sleep(args.delay)
+                # Fetch HTML and markdown in parallel
+                html_task = fetch_text(client, u)
+                markdown_task = fetch_markdown(client, u)
+                html, markdown = await asyncio.gather(html_task, markdown_task)
+                
+                await asyncio.sleep(WAIT_TIME_BETWEEN_REQUESTS)
                 if not html:
-                    return
-                prod = parse_product_from_html(u, html)
+                    log.info(f"No HTML found for {u}, sleeping for {SLEEP_TIME_ON_ERROR} seconds and retrying...")
+                    await asyncio.sleep(SLEEP_TIME_ON_ERROR)
+                    html = await fetch_text(client, u)
+                    if not html:
+                        log.warning(f"❌ No HTML found for {u}")
+                        return
+                    else:
+                        log.debug(f"✅ HTML found for {u}")
+                else:
+                    log.debug(f"✅ HTML found for {u}")
+                
+                if markdown:
+                    log.debug(f"✅ Markdown found for {u}")
+                
+                prod = parse_product_from_html(u, html, markdown=markdown)
                 products.append(prod.to_dict())
 
         # Step 2: Scrape product pages
@@ -918,6 +1064,12 @@ async def main():
 
         products.sort(key=lambda x: x.get("url", ""))
         
+        # Filter out products without useful data (no name = likely failed parse)
+        valid_products = [p for p in products if p.get("name")]
+        skipped = len(products) - len(valid_products)
+        if skipped > 0:
+            log.info(f"⏭️  Skipping {skipped} products without names (failed to parse product data)")
+        
         # Save to PostgreSQL or JSON file
         if args.use_postgres:
             db = DatabaseManager(DB_CONFIG)
@@ -925,16 +1077,17 @@ async def main():
             await db.initialize_schema()
             
             source_site = urlparse(base).netloc
-            saved_count = await db.save_products_batch(products, source_site)
+            log.info(f"💾 Saving {len(valid_products)} valid products to database...")
+            saved_count = await db.save_products_batch(valid_products, source_site)
             total_count = await db.get_product_count(source_site)
             await db.close()
             
-            log.info(f"💾 Saved {saved_count} products to PostgreSQL ({total_count} total for {source_site}) ⏱️  {step2_elapsed:.1f}s")
+            log.info(f"✅ Saved {saved_count} products to PostgreSQL ({total_count} total for {source_site}) ⏱️  {step2_elapsed:.1f}s")
         else:
             out_json = os.path.join(out_dir, "products.json")
             with open(out_json, "w", encoding="utf-8") as f:
-                json.dump(products, f, ensure_ascii=False, indent=2)
-            log.info(f"💾 Saved {len(products)} products -> {out_json} ⏱️  {step2_elapsed:.1f}s")
+                json.dump(valid_products, f, ensure_ascii=False, indent=2)
+            log.info(f"💾 Saved {len(valid_products)} products -> {out_json} ⏱️  {step2_elapsed:.1f}s")
 
         if args.download_images:
             # Step 3: Download images
@@ -954,7 +1107,7 @@ async def main():
                     path = os.path.join(img_dir, fname)
                     if await download_file(client, img_url, path):
                         ok += 1
-                    await asyncio.sleep(args.delay)
+                    await asyncio.sleep(WAIT_TIME_BETWEEN_REQUESTS)
             step3_elapsed = time.time() - step3_start
 
             log.info(f"🎉 Downloaded {ok} images -> {img_dir} ⏱️  {step3_elapsed:.1f}s")

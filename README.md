@@ -21,6 +21,16 @@ python scrape_products.py \
   --url-regex='\.html' \
   --download-images \
   --use-postgres
+
+# province of canada
+python scrape_products.py \
+  --base https://provinceofcanada.com \
+  --out ./province_of_canada_out \
+  --use-browser \
+  --store-type shopify \
+  --max-categories 300 \
+  --download-images \
+  --use-postgres
 ```
 
 ## Running the App
