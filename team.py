@@ -85,23 +85,26 @@ async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N) -
     
     Args:
         query: The user's search query
-        results: List of tuples from database (name, brand, description, price, currency, url, source_site, similarity, markdown)
+        results: List of tuples from database
         top_n: Number of top results to return after re-ranking
         
     Returns:
-        Re-ranked list of results (same format as input)
+        Re-ranked list of tuples with rerank_score appended to each result
     """
     if not results:
         return results
     
     # Create documents for re-ranking (combine name, brand, description)
     documents = []
-    for name, brand, description, price, currency, url, source_site, similarity, markdown in results:
+    for row in results:
+        name, brand, description, price, currency = row[0], row[1], row[2], row[3], row[4]
+        markdown = row[8] if len(row) > 8 else None
+        
         doc_text = f"Product Name: {name or ''} | Brand Name: {brand or ''}"
         if description:
-            doc_text += f" | Description: {description[:MAX_DESCRIPTION_LENGTH] if description else ''}"
+            doc_text += f" | Description: {description[:MAX_DESCRIPTION_LENGTH]}"
         if markdown:
-            doc_text += f" | Markdown Content: {markdown[:MAX_MARKDOWN_LENGTH] if markdown else ''}"
+            doc_text += f" | Markdown Content: {markdown[:MAX_MARKDOWN_LENGTH]}"
         if price:
             doc_text += f" | Price: {price} {currency or ''}"
         logger.debug(f"Document text: {doc_text}")
@@ -116,96 +119,243 @@ async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N) -
             top_n=min(top_n, len(results)),
         )
         
-        # Re-order results based on rerank scores
+        # Re-order results and append rerank score
         reranked_results = []
         for result in rerank_response.results:
             original_idx = result.index
-            reranked_results.append(results[original_idx])
+            rerank_score = result.relevance_score
+            # Append rerank_score to the tuple
+            reranked_results.append((*results[original_idx], rerank_score))
         
         logger.info(f"🔄 Re-ranked {len(results)} results → top {len(reranked_results)}")
         return reranked_results
         
     except Exception as e:
         logger.warning(f"⚠️ Re-ranking failed, using original order: {e}")
-        return results[:top_n]
+        # Return with None for rerank_score
+        return [(*r, None) for r in results[:top_n]]
 
 
 async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
-    """Search the product knowledge base for similar products.
-    
-    Args:
-        query: The user's query to search for
-        limit: Number of results to return after re-ranking (default: 10)
-        
-    Returns:
-        A formatted string with relevant products
-    """
+    """Hybrid search (vector + lexical/FTS) then rerank."""
     try:
         # Generate embedding for the query
         embedding = await generate_embedding(query)
-        embedding_str = '[' + ','.join(str(x) for x in embedding) + ']'
-        
-        # Connect to database
-        conn_string = f"host={DB_CONFIG['host']} dbname={DB_CONFIG['dbname']} user={DB_CONFIG['user']} password={DB_CONFIG['password']}"
-        conn = await psycopg.AsyncConnection.connect(conn_string)
-        
-        async with conn.cursor() as cur:
-            # Fetch more results initially for re-ranking
-            sql_query = """
-                SELECT 
-                    name,
-                    brand,
-                    description,
-                    price,
-                    currency,
-                    url,
-                    source_site,
-                    1 - (embedding <=> %s::vector) AS similarity,
-                    markdown as markdown_content
-                FROM products
-                WHERE embedding IS NOT NULL
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-            """
-            await cur.execute(sql_query, (embedding_str, embedding_str, INITIAL_SEARCH_LIMIT))
-            results = await cur.fetchall()
-            
-            if results:
-                logger.info(f"🔍 Found {len(results)} products (top similarity: {results[0][7]:.2%})")
-            else:
-                logger.warning(f"No products found in the knowledge base. Try a different search query than '{query}'")
-        await conn.close()
-        
-        if not results:
+        embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+
+        # Tuning knobs
+        VECTOR_CANDIDATES = INITIAL_SEARCH_LIMIT            # e.g. 50-200
+        TEXT_CANDIDATES = INITIAL_SEARCH_LIMIT              # e.g. 50-200
+        HYBRID_CANDIDATES = max(VECTOR_CANDIDATES, TEXT_CANDIDATES)
+        ALPHA = 0.5  # weight for vector similarity (0..1). Higher = more semantic, lower = more keyword
+
+        conn_string = (
+            f"host={DB_CONFIG['host']} "
+            f"dbname={DB_CONFIG['dbname']} "
+            f"user={DB_CONFIG['user']} "
+            f"password={DB_CONFIG['password']}"
+        )
+
+        results = []
+        async with await psycopg.AsyncConnection.connect(conn_string) as conn:
+            async with conn.cursor() as cur:
+                # Notes:
+                # - Vector candidates: fastest with ivfflat index on embedding
+                # - Text candidates: uses Postgres FTS (to_tsvector/plainto_tsquery)
+                # - We normalize text rank to 0..1 across candidates, then blend with vector sim.
+                # - If you already have a precomputed tsvector column, swap the to_tsvector(...) with that column.
+                sql_query = """
+                    --sql
+                    WITH
+                    q AS (
+                        SELECT
+                            %s::vector AS q_embedding,
+                            plainto_tsquery('english', %s) AS q_ts
+                    ),
+
+                    vec AS (
+                        SELECT
+                            p.name,
+                            p.brand,
+                            p.description,
+                            p.price,
+                            p.currency,
+                            p.url,
+                            p.source_site,
+                            (1 - (p.embedding <=> q.q_embedding))::float AS vector_similarity,
+                            0.0::float AS text_rank,
+                            p.markdown AS markdown_content
+                        FROM products p
+                        CROSS JOIN q
+                        WHERE p.embedding IS NOT NULL
+                        ORDER BY p.embedding <=> q.q_embedding
+                        LIMIT %s
+                    ),
+
+                    txt AS (
+                        SELECT
+                            p.name,
+                            p.brand,
+                            p.description,
+                            p.price,
+                            p.currency,
+                            p.url,
+                            p.source_site,
+                            NULL::float AS vector_similarity,
+                            ts_rank_cd(
+                                to_tsvector('english',
+                                    coalesce(p.name,'') || ' ' ||
+                                    coalesce(p.brand,'') || ' ' ||
+                                    coalesce(p.description,'')
+                                ),
+                                q.q_ts
+                            )::float AS text_rank,
+                            p.markdown AS markdown_content
+                        FROM products p
+                        CROSS JOIN q
+                        WHERE q.q_ts @@ to_tsvector('english',
+                            coalesce(p.name,'') || ' ' ||
+                            coalesce(p.brand,'') || ' ' ||
+                            coalesce(p.description,'')
+                        )
+                        ORDER BY text_rank DESC
+                        LIMIT %s
+                    ),
+
+                    candidates AS (
+                        SELECT * FROM vec
+                        UNION ALL
+                        SELECT * FROM txt
+                    ),
+
+                    deduped AS (
+                        -- If the same product appears in both sets, keep the best signals.
+                        SELECT
+                            url,
+                            max(name) AS name,
+                            max(brand) AS brand,
+                            max(description) AS description,
+                            max(price) AS price,
+                            max(currency) AS currency,
+                            max(source_site) AS source_site,
+                            max(markdown_content) AS markdown_content,
+                            max(coalesce(vector_similarity, 0.0)) AS vector_similarity,
+                            max(coalesce(text_rank, 0.0)) AS text_rank
+                        FROM candidates
+                        GROUP BY url
+                    ),
+
+                    scored AS (
+                        SELECT
+                            name,
+                            brand,
+                            description,
+                            price,
+                            currency,
+                            url,
+                            source_site,
+                            vector_similarity,
+                            text_rank,
+                            -- Normalize vector_similarity across candidates to 0..1 (min-max)
+                            CASE
+                                WHEN max(vector_similarity) OVER () > min(vector_similarity) OVER ()
+                                THEN (vector_similarity - min(vector_similarity) OVER ()) / 
+                                     (max(vector_similarity) OVER () - min(vector_similarity) OVER ())
+                                ELSE 1.0
+                            END AS vector_similarity_norm,
+                            -- Normalize text_rank across candidates to 0..1 (min-max)
+                            CASE
+                                WHEN max(text_rank) OVER () > min(text_rank) OVER ()
+                                THEN (text_rank - min(text_rank) OVER ()) / 
+                                     (max(text_rank) OVER () - min(text_rank) OVER ())
+                                ELSE 0.0
+                            END AS text_rank_norm,
+                            markdown_content
+                        FROM deduped
+                    )
+
+                    SELECT
+                        name,
+                        brand,
+                        description,
+                        price,
+                        currency,
+                        url,
+                        source_site,
+                        vector_similarity AS similarity,
+                        markdown_content,
+                        (%s * vector_similarity_norm) + ((1 - %s) * text_rank_norm) AS hybrid_score
+                    FROM scored
+                    ORDER BY hybrid_score DESC
+                    LIMIT %s
+                    --end-sql
+                """
+
+                # Pull a combined candidate set (bigger than final limit) then rerank down.
+                await cur.execute(
+                    sql_query,
+                    (
+                        embedding_str,
+                        query,
+                        VECTOR_CANDIDATES,
+                        TEXT_CANDIDATES,
+                        ALPHA,  # for hybrid_score calculation
+                        ALPHA,  # for hybrid_score calculation
+                        HYBRID_CANDIDATES,
+                    ),
+                )
+                results = await cur.fetchall()
+
+        if results:
+            # hybrid_score is at index 9
+            top_score = results[0][9] if results[0][9] is not None else 0.0
+            logger.info(f"🔍 Found {len(results)} hybrid candidates (top hybrid score: {top_score:.2%})")
+        else:
+            logger.warning(f"No products found. Try a different search query than '{query}'")
             return "No products found in the knowledge base. Try a different search query."
-        
-        # Cohere Re-ranking - filter to top N most relevant
+
+        # Rerank down to final limit (e.g., Cohere rerank)
         results = await rerank_results(query, results, top_n=limit)
-        
-        
-        # Format results
+
+        # Format results - tuple now includes rerank_score at the end
         formatted_results = [f"Found {len(results)} products matching your query:\n"]
-        for i, (name, brand, description, price, currency, url, source_site, similarity, markdown_content) in enumerate(results, 1):
+        for i, row in enumerate(results, 1):
+            # Unpack: name, brand, description, price, currency, url, source_site, similarity, markdown_content, hybrid_score, rerank_score
+            name = row[0]
+            brand = row[1]
+            description = row[2]
+            price = row[3]
+            currency = row[4]
+            url = row[5]
+            source_site = row[6]
+            similarity = row[7]
+            markdown_content = row[8]
+            # hybrid_score = row[9]  # not shown to user
+            rerank_score = row[-1]  # Last element is rerank_score
+            
             formatted_results.append(f"### {i}. {name or 'Unknown Product'}")
+            if rerank_score is not None:
+                formatted_results.append(f" (Score: {rerank_score:.0%})")
             if brand:
-                formatted_results.append(f"**Brand:** {brand}")
+                formatted_results.append(f"\n\n**Brand:** {brand}")
             if price:
-                formatted_results.append(f"**Price:** {price} {currency or ''}")
+                formatted_results.append(f"\n\n**Price:** {price} {currency or ''}")
             if description:
                 desc_short = description[:MAX_DESCRIPTION_LENGTH] + "..." if len(description) > MAX_DESCRIPTION_LENGTH else description
-                formatted_results.append(f"**Description:** {desc_short}")
+                formatted_results.append(f"\n\n**Product Description:** {desc_short}")
             if markdown_content:
                 markdown_short = markdown_content[:MAX_MARKDOWN_LENGTH] + "..." if len(markdown_content) > MAX_MARKDOWN_LENGTH else markdown_content
-                formatted_results.append(f"**Markdown:** {markdown_short}")
-            formatted_results.append(f"**Link:** [{url}]({url})")
-            formatted_results.append(f"**Source:** {source_site} | **Match:** {similarity:.1%}")
+                formatted_results.append(f"\n\n**Raw Markdown Content:** {markdown_short}")
+            formatted_results.append(f"\n\n**Link:** [{url}]({url})")
+            formatted_results.append(f"\n\n**Source:** {source_site}")
             formatted_results.append("")
-        
+
         return "\n".join(formatted_results)
-        
+
     except Exception as e:
         logger.error(f"Error searching products: {e}")
         return f"Error accessing product database: {str(e)}"
+
 
 
 def search_products_sync(query: str, limit: int = 10) -> str:
@@ -241,6 +391,7 @@ def get_product_finding_instructions() -> str:
         - Product name and brand
         - Price (if available)
         - Link to the product
+        - Relevance score (shown as percentage - this indicates how well the product matches the query)
         - Whether it's Made in Canada
         
         Focus on Canadian brands like: Roots, Lululemon, Canada Goose, Aritzia, 
@@ -250,8 +401,11 @@ def get_product_finding_instructions() -> str:
         - Product Name
         - Brand  
         - Price
+        - Score
         - Link
         - Made in Canada?
+        
+        Sort the table by Score descending (highest relevance first).
         
         At the end, ask the user a meaningful follow-up question.
     """)
