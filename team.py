@@ -94,6 +94,9 @@ async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N) -
     if not results:
         return results
     
+    # TODO: let's rank things better (ex: pass in emp bayes smoothed ratings to the re-ranker, or rank again after the re-ranker based on ratings)
+    query = query + " | give higher relevance to products that are made in canada and products with high average ratings - but consider the number of reviews too (ex: 4.8 stars and 100 reviews is better than 5 stars and 1 reviews)"
+    
     # Create documents for re-ranking (combine name, brand, description)
     documents = []
     for row in results:
@@ -184,7 +187,10 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                             p.source_site,
                             (1 - (p.embedding <=> q.q_embedding))::float AS vector_similarity,
                             0.0::float AS text_rank,
-                            p.markdown AS markdown_content
+                            p.markdown AS markdown_content,
+                            p.num_reviews,
+                            p.average_rating,
+                            p.images
                         FROM products p
                         CROSS JOIN q
                         WHERE p.embedding IS NOT NULL
@@ -210,7 +216,10 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                                 ),
                                 q.q_ts
                             )::float AS text_rank,
-                            p.markdown AS markdown_content
+                            p.markdown AS markdown_content,
+                            p.num_reviews,
+                            p.average_rating,
+                            p.images
                         FROM products p
                         CROSS JOIN q
                         WHERE q.q_ts @@ to_tsvector('english',
@@ -240,7 +249,10 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                             max(source_site) AS source_site,
                             max(markdown_content) AS markdown_content,
                             max(coalesce(vector_similarity, 0.0)) AS vector_similarity,
-                            max(coalesce(text_rank, 0.0)) AS text_rank
+                            max(coalesce(text_rank, 0.0)) AS text_rank,
+                            max(num_reviews) AS num_reviews,
+                            max(average_rating) AS average_rating,
+                            max(images::text)::jsonb AS images
                         FROM candidates
                         GROUP BY url
                     ),
@@ -270,7 +282,10 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                                      (max(text_rank) OVER () - min(text_rank) OVER ())
                                 ELSE 0.0
                             END AS text_rank_norm,
-                            markdown_content
+                            markdown_content,
+                            num_reviews,
+                            average_rating,
+                            images
                         FROM deduped
                     )
 
@@ -284,7 +299,10 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                         source_site,
                         vector_similarity AS similarity,
                         markdown_content,
-                        (%s * vector_similarity_norm) + ((1 - %s) * text_rank_norm) AS hybrid_score
+                        (%s * vector_similarity_norm) + ((1 - %s) * text_rank_norm) AS hybrid_score,
+                        num_reviews,
+                        average_rating,
+                        images
                     FROM scored
                     ORDER BY hybrid_score DESC
                     LIMIT %s
@@ -318,9 +336,10 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
         results = await rerank_results(query, results, top_n=limit)
 
         # Format results - tuple now includes rerank_score at the end
+        # Columns: name(0), brand(1), description(2), price(3), currency(4), url(5), source_site(6), 
+        #          similarity(7), markdown_content(8), hybrid_score(9), num_reviews(10), average_rating(11), images(12), rerank_score(13)
         formatted_results = [f"Found {len(results)} products matching your query:\n"]
         for i, row in enumerate(results, 1):
-            # Unpack: name, brand, description, price, currency, url, source_site, similarity, markdown_content, hybrid_score, rerank_score
             name = row[0]
             brand = row[1]
             description = row[2]
@@ -331,15 +350,29 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
             similarity = row[7]
             markdown_content = row[8]
             # hybrid_score = row[9]  # not shown to user
+            num_reviews = row[10]
+            average_rating = row[11]
+            images = row[12]  # JSONB array of image URLs
             rerank_score = row[-1]  # Last element is rerank_score
             
             formatted_results.append(f"### {i}. {name or 'Unknown Product'}")
             if rerank_score is not None:
-                formatted_results.append(f" (Score: {rerank_score:.0%})")
+                formatted_results.append(f" (Score: `{rerank_score:.0%}`)")
+            
+            # Add product image (first image from the array)
+            if images and isinstance(images, list) and len(images) > 0:
+                first_image = images[0]
+                formatted_results.append(f"\n\n![{name or 'Product Image'}]({first_image})")
+            
             if brand:
                 formatted_results.append(f"\n\n**Brand:** {brand}")
             if price:
-                formatted_results.append(f"\n\n**Price:** {price} {currency or ''}")
+                formatted_results.append(f"\n\n**Price:** `{price} {currency or ''}`")
+            # Add reviews section
+            if average_rating is not None or num_reviews is not None:
+                rating_str = f"`{average_rating:.1f}`⭐" if average_rating else "N/A"
+                reviews_str = f"`{num_reviews}` reviews" if num_reviews else "No reviews"
+                formatted_results.append(f"\n\n**Reviews:** {rating_str} ({reviews_str})")
             if description:
                 desc_short = description[:MAX_DESCRIPTION_LENGTH] + "..." if len(description) > MAX_DESCRIPTION_LENGTH else description
                 formatted_results.append(f"\n\n**Product Description:** {desc_short}")
@@ -374,8 +407,6 @@ def get_product_finding_instructions() -> str:
     """Get the instructions for the product finding agent"""
     # TODO: we need to improve the data in the database + filtering abilities
     # 1. actually made in canada or just a canadian company?
-    # 2. images?
-    # 3. ratings?
     return dedent("""
         You are an expert at finding Made in Canada products and Canadian-owned businesses.
         
@@ -383,29 +414,40 @@ def get_product_finding_instructions() -> str:
         
         Here are the steps you need to follow:
         1. Search the product knowledge base for matching products
-        2. Present the results in a clear, formatted table
+        2. Present the results with product images and details
         3. Highlight which products are Made in Canada vs Canadian-owned
         4. Ask a follow-up question to help the user further
         
-        When presenting products, include:
-        - Product name and brand
+        When presenting products, ALWAYS include ALL of these fields:
+        - Product image (displayed as markdown image)
+        - Product name and brand (REMOVE any sizing info like "- XS", "- S/M", "Size Large", "XXL", etc. from product names)
         - Price (if available)
+        - Reviews - ALWAYS show rating and review count (e.g. "4.5⭐ (23 reviews)"). If no reviews, show "No reviews yet"
+        - Product description - ALWAYS include a brief description of the product
         - Link to the product
         - Relevance score (shown as percentage - this indicates how well the product matches the query)
         - Whether it's Made in Canada
         
+        IMPORTANT: Clean up product names by removing size variants. For example:
+        - "Classic Hoodie - XS" → "Classic Hoodie"
+        - "Cozy Sweater Size Medium" → "Cozy Sweater"
+        - "T-Shirt Navy - L/XL" → "T-Shirt Navy"
+        
         Focus on Canadian brands like: Roots, Lululemon, Canada Goose, Aritzia, 
         Province of Canada, Mejuri, Duer, etc.
         
-        Format your response into a table with columns:
-        - Product Name
-        - Brand  
-        - Price
-        - Score
-        - Link
-        - Made in Canada?
+        Present each product as a card with its image followed by details. The search results 
+        already include markdown-formatted images - preserve and display these images in your response.
         
-        Sort the table by Score descending (highest relevance first).
+        IMPORTANT FORMATTING: When displaying numbers to the user, wrap them in backticks for visual emphasis:
+        - Price: `\\$78.00 CAD`
+        - Score: `92%`
+        - Rating: `4.5`⭐ (`23` reviews)
+        
+        NEVER skip the Reviews or Description fields - they help users make informed decisions.
+        If reviews are missing, show "No reviews yet". If description is missing, write a brief one based on the product name.
+        
+        Sort products by Score descending (highest relevance first).
         
         At the end, ask the user a meaningful follow-up question.
     """)

@@ -192,6 +192,8 @@ class DatabaseManager:
                     images JSONB,
                     html TEXT,
                     markdown TEXT,
+                    num_reviews INTEGER,
+                    average_rating REAL,
                     source_site TEXT,
                     embedding vector({EMBEDDING_DIMENSIONS}),
                     scraped_at TIMESTAMP DEFAULT NOW(),
@@ -208,6 +210,14 @@ class DatabaseManager:
             # Add markdown column if it doesn't exist (for existing tables)
             await cur.execute("""
                 ALTER TABLE products ADD COLUMN IF NOT EXISTS markdown TEXT
+            """)
+            
+            # Add review columns if they don't exist (for existing tables)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS num_reviews INTEGER
+            """)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS average_rating REAL
             """)
             
             # Create index on URL for fast lookups
@@ -269,8 +279,8 @@ class DatabaseManager:
         async with self.conn.cursor() as cur:
             await cur.execute(
                 """
-                INSERT INTO products (url, name, brand, sku, description, price, currency, availability, images, html, markdown, source_site, embedding, scraped_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, NOW(), NOW())
+                INSERT INTO products (url, name, brand, sku, description, price, currency, availability, images, html, markdown, num_reviews, average_rating, source_site, embedding, scraped_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, NOW(), NOW())
                 ON CONFLICT (url) DO UPDATE SET
                     name = EXCLUDED.name,
                     brand = EXCLUDED.brand,
@@ -282,6 +292,8 @@ class DatabaseManager:
                     images = EXCLUDED.images,
                     html = EXCLUDED.html,
                     markdown = EXCLUDED.markdown,
+                    num_reviews = EXCLUDED.num_reviews,
+                    average_rating = EXCLUDED.average_rating,
                     embedding = EXCLUDED.embedding,
                     scraped_at = NOW(),
                     updated_at = NOW()
@@ -299,6 +311,8 @@ class DatabaseManager:
                     Json(product.get("images", [])),
                     product.get("html"),
                     product.get("markdown"),
+                    product.get("num_reviews"),
+                    product.get("average_rating"),
                     source_site,
                     embedding_str,
                 ),
@@ -369,6 +383,8 @@ class Product:
     images: List[str] = None
     html: Optional[str] = None  # Raw HTML of the product page
     markdown: Optional[str] = None  # Markdown version of the product page
+    num_reviews: Optional[int] = None  # Number of reviews
+    average_rating: Optional[float] = None  # Average rating (typically 1-5)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -383,6 +399,8 @@ class Product:
             "images": self.images or [],
             "html": self.html,
             "markdown": self.markdown,
+            "num_reviews": self.num_reviews,
+            "average_rating": self.average_rating,
         }
 
 
@@ -847,17 +865,181 @@ def pick_best_product_schema(schemas: List[Dict[str, Any]]) -> Optional[Dict[str
     return scored[0][1]
 
 
+def extract_reviews_from_html(html: str, url: str = "") -> Tuple[Optional[int], Optional[float]]:
+    """
+    Extract review count and average rating from HTML.
+    Supports multiple review formats:
+    - MetafieldReviews JS variable (Shopify/Stamped)
+    - Yotpo, Loox, Okendo metafields
+    - Schema.org AggregateRating
+    
+    Returns: (num_reviews, average_rating)
+    """
+    num_reviews = None
+    average_rating = None
+    source = None  # Track which pattern found the reviews
+    
+    log.debug(f"🔍 Searching for reviews in {url[:60]}...")
+    
+    # Pattern 1: MetafieldReviews JS variable (Stamped reviews)
+    # Example: MetafieldReviews = {"rating":{"scale_min":"1.0","scale_max":"5.0","value":"5.0"},"rating_count":6};
+    metafield_match = re.search(r'MetafieldReviews\s*=\s*(\{[^;]+\});?', html)
+    if metafield_match:
+        log.debug(f"   📋 Found MetafieldReviews variable, parsing...")
+        try:
+            data = json.loads(metafield_match.group(1))
+            log.debug(f"   📋 MetafieldReviews data: {data}")
+            if isinstance(data, dict):
+                if "rating_count" in data:
+                    num_reviews = int(data["rating_count"])
+                if "rating" in data and isinstance(data["rating"], dict):
+                    if "value" in data["rating"]:
+                        average_rating = float(data["rating"]["value"])
+                if num_reviews is not None or average_rating is not None:
+                    source = "MetafieldReviews (Stamped)"
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            log.debug(f"   ⚠️ Failed to parse MetafieldReviews: {e}")
+    
+    # Pattern 2: Yotpo metafields
+    # Example: MetafieldYotpoRating = "4.5"; MetafieldYotpoCount = "123";
+    if average_rating is None:
+        yotpo_rating = re.search(r'MetafieldYotpoRating\s*=\s*["\']?([0-9.]+)["\']?', html)
+        yotpo_count = re.search(r'MetafieldYotpoCount\s*=\s*["\']?(\d+)["\']?', html)
+        if yotpo_rating or yotpo_count:
+            log.debug(f"   📋 Found Yotpo metafields...")
+        if yotpo_rating:
+            try:
+                average_rating = float(yotpo_rating.group(1))
+                source = "Yotpo"
+            except ValueError:
+                pass
+        if yotpo_count:
+            try:
+                num_reviews = int(yotpo_count.group(1))
+                source = "Yotpo"
+            except ValueError:
+                pass
+    
+    # Pattern 3: Loox metafields
+    if average_rating is None:
+        loox_rating = re.search(r'MetafieldLooxRating\s*=\s*["\']?([0-9.]+)["\']?', html)
+        loox_count = re.search(r'MetafieldLooxCount\s*=\s*["\']?(\d+)["\']?', html)
+        if loox_rating or loox_count:
+            log.debug(f"   📋 Found Loox metafields...")
+        if loox_rating:
+            try:
+                average_rating = float(loox_rating.group(1))
+                source = "Loox"
+            except ValueError:
+                pass
+        if loox_count:
+            try:
+                num_reviews = int(loox_count.group(1))
+                source = "Loox"
+            except ValueError:
+                pass
+    
+    # Pattern 4: Okendo metafields
+    if average_rating is None:
+        okendo_rating = re.search(r'okendoProductReviewAverageValue\s*=\s*["\']?([0-9.]+)["\']?', html)
+        okendo_count = re.search(r'okendoProductReviewCount\s*=\s*["\']?(\d+)["\']?', html)
+        if okendo_rating or okendo_count:
+            log.debug(f"   📋 Found Okendo metafields...")
+        if okendo_rating:
+            try:
+                average_rating = float(okendo_rating.group(1))
+                source = "Okendo"
+            except ValueError:
+                pass
+        if okendo_count:
+            try:
+                num_reviews = int(okendo_count.group(1))
+                source = "Okendo"
+            except ValueError:
+                pass
+    
+    # Pattern 5: Schema.org AggregateRating in JSON-LD
+    if average_rating is None:
+        soup = BeautifulSoup(html, "html.parser")
+        json_ld_scripts = soup.find_all("script", attrs={"type": "application/ld+json"})
+        log.debug(f"   📋 Checking {len(json_ld_scripts)} JSON-LD scripts for AggregateRating...")
+        
+        for script in json_ld_scripts:
+            if not script.string:
+                continue
+            try:
+                data = json.loads(script.string)
+                
+                def find_aggregate_rating(obj):
+                    if isinstance(obj, dict):
+                        if obj.get("@type") == "AggregateRating" or "aggregateRating" in obj:
+                            rating_obj = obj if obj.get("@type") == "AggregateRating" else obj.get("aggregateRating", {})
+                            if isinstance(rating_obj, dict):
+                                return rating_obj
+                        for v in obj.values():
+                            result = find_aggregate_rating(v)
+                            if result:
+                                return result
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            result = find_aggregate_rating(item)
+                            if result:
+                                return result
+                    return None
+                
+                agg_rating = find_aggregate_rating(data)
+                if agg_rating:
+                    log.debug(f"   📋 Found AggregateRating: {agg_rating}")
+                    if "ratingValue" in agg_rating:
+                        try:
+                            average_rating = float(agg_rating["ratingValue"])
+                        except (ValueError, TypeError):
+                            pass
+                    if "reviewCount" in agg_rating:
+                        try:
+                            num_reviews = int(agg_rating["reviewCount"])
+                        except (ValueError, TypeError):
+                            pass
+                    elif "ratingCount" in agg_rating:
+                        try:
+                            num_reviews = int(agg_rating["ratingCount"])
+                        except (ValueError, TypeError):
+                            pass
+                    if average_rating or num_reviews:
+                        source = "Schema.org AggregateRating"
+                        break
+            except json.JSONDecodeError:
+                continue
+    
+    # Log the final result
+    if num_reviews is not None or average_rating is not None:
+        rating_str = f"{average_rating:.1f}⭐" if average_rating else "N/A"
+        reviews_str = f"{num_reviews} reviews" if num_reviews else "N/A"
+        log.info(f"⭐ Reviews found: {rating_str} ({reviews_str}) via {source}")
+    else:
+        log.debug(f"   ℹ️ No reviews found for this product")
+    
+    return num_reviews, average_rating
+
+
 def parse_product_from_html(url: str, html: str, markdown: Optional[str] = None) -> Product:
     soup = BeautifulSoup(html, "html.parser")
     p = Product(url=url, images=[], html=html, markdown=markdown)
+    
+    log.debug(f"🔍 Parsing product from {url[:60]}...")
+    
+    # Extract reviews
+    p.num_reviews, p.average_rating = extract_reviews_from_html(html, url=url)
 
     schemas = extract_json_ld_products(html)
     schema = pick_best_product_schema(schemas)
+    log.debug(f"   📋 Found {len(schemas)} JSON-LD Product schemas")
 
     if schema:
         p.name = schema.get("name")
         p.description = schema.get("description")
         p.sku = schema.get("sku")
+        log.debug(f"   📦 Product name: {p.name[:50] if p.name else 'N/A'}...")
 
         brand = schema.get("brand")
         if isinstance(brand, dict):
@@ -869,8 +1051,15 @@ def parse_product_from_html(url: str, html: str, markdown: Optional[str] = None)
         img = schema.get("image")
         if isinstance(img, str):
             p.images.append(img)
+            log.debug(f"   🖼️ Found 1 image from JSON-LD (string)")
         elif isinstance(img, list):
-            p.images.extend([x for x in img if isinstance(x, str)])
+            valid_imgs = [x for x in img if isinstance(x, str)]
+            p.images.extend(valid_imgs)
+            log.debug(f"   🖼️ Found {len(valid_imgs)} images from JSON-LD (list)")
+        elif img:
+            log.debug(f"   ⚠️ Image field has unexpected type: {type(img)}")
+        else:
+            log.debug(f"   ℹ️ No image field in JSON-LD schema")
 
         offers = schema.get("offers")
         # offers can be dict or list
@@ -885,6 +1074,7 @@ def parse_product_from_html(url: str, html: str, markdown: Optional[str] = None)
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
             p.name = og_title["content"].strip()
+            log.debug(f"   📦 Product name (from og:title): {p.name[:50]}...")
 
     if not p.description:
         og_desc = soup.find("meta", property="og:description")
@@ -896,6 +1086,9 @@ def parse_product_from_html(url: str, html: str, markdown: Optional[str] = None)
         og_img = soup.find("meta", property="og:image")
         if og_img and og_img.get("content"):
             p.images.append(og_img["content"].strip())
+            log.debug(f"   🖼️ Found 1 image from og:image fallback")
+        else:
+            log.debug(f"   ⚠️ No og:image meta tag found")
 
     # De-dupe images
     seen = set()
@@ -904,7 +1097,16 @@ def parse_product_from_html(url: str, html: str, markdown: Optional[str] = None)
         if i and i not in seen:
             imgs.append(i)
             seen.add(i)
+    
+    dupes_removed = len(p.images) - len(imgs)
     p.images = imgs
+    
+    # Final image summary
+    if p.images:
+        log.info(f"🖼️ Extracted {len(p.images)} image(s) for '{p.name[:40] if p.name else 'Unknown'}...' {f'({dupes_removed} duplicates removed)' if dupes_removed else ''}")
+        log.debug(f"   🖼️ First image: {p.images[0][:80]}...")
+    else:
+        log.debug(f"   ❌ No images found for this product")
 
     return p
 
