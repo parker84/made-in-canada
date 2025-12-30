@@ -63,6 +63,18 @@ try:
 except ImportError:
     pass
 
+# OpenAI is optional - used for AI-based Made in Canada detection
+openai_available = False
+try:
+    from openai import AsyncOpenAI
+    openai_available = True
+except ImportError:
+    pass
+
+# AI Model for Made in Canada detection
+MADE_IN_CANADA_MODEL = config("MADE_IN_CANADA_MODEL", default="gpt-5-nano")
+MAX_AI_DETECTION_LEN = 10000
+
 # Embedding Configuration
 EMBEDDING_MODEL = "embed-v4.0"
 EMBEDDING_DIMENSIONS = 1536
@@ -192,8 +204,11 @@ class DatabaseManager:
                     images JSONB,
                     html TEXT,
                     markdown TEXT,
+                    json_data JSONB,
                     num_reviews INTEGER,
                     average_rating REAL,
+                    made_in_canada BOOLEAN,
+                    made_in_canada_reason TEXT,
                     source_site TEXT,
                     embedding vector({EMBEDDING_DIMENSIONS}),
                     scraped_at TIMESTAMP DEFAULT NOW(),
@@ -212,12 +227,25 @@ class DatabaseManager:
                 ALTER TABLE products ADD COLUMN IF NOT EXISTS markdown TEXT
             """)
             
+            # Add json_data column if it doesn't exist (for existing tables)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS json_data JSONB
+            """)
+            
             # Add review columns if they don't exist (for existing tables)
             await cur.execute("""
                 ALTER TABLE products ADD COLUMN IF NOT EXISTS num_reviews INTEGER
             """)
             await cur.execute("""
                 ALTER TABLE products ADD COLUMN IF NOT EXISTS average_rating REAL
+            """)
+            
+            # Add made_in_canada columns if they don't exist (for existing tables)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS made_in_canada BOOLEAN
+            """)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS made_in_canada_reason TEXT
             """)
             
             # Create index on URL for fast lookups
@@ -279,8 +307,8 @@ class DatabaseManager:
         async with self.conn.cursor() as cur:
             await cur.execute(
                 """
-                INSERT INTO products (url, name, brand, sku, description, price, currency, availability, images, html, markdown, num_reviews, average_rating, source_site, embedding, scraped_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, NOW(), NOW())
+                INSERT INTO products (url, name, brand, sku, description, price, currency, availability, images, html, markdown, json_data, num_reviews, average_rating, made_in_canada, made_in_canada_reason, source_site, embedding, scraped_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, NOW(), NOW())
                 ON CONFLICT (url) DO UPDATE SET
                     name = EXCLUDED.name,
                     brand = EXCLUDED.brand,
@@ -292,8 +320,11 @@ class DatabaseManager:
                     images = EXCLUDED.images,
                     html = EXCLUDED.html,
                     markdown = EXCLUDED.markdown,
+                    json_data = EXCLUDED.json_data,
                     num_reviews = EXCLUDED.num_reviews,
                     average_rating = EXCLUDED.average_rating,
+                    made_in_canada = EXCLUDED.made_in_canada,
+                    made_in_canada_reason = EXCLUDED.made_in_canada_reason,
                     embedding = EXCLUDED.embedding,
                     scraped_at = NOW(),
                     updated_at = NOW()
@@ -311,8 +342,11 @@ class DatabaseManager:
                     Json(product.get("images", [])),
                     product.get("html"),
                     product.get("markdown"),
+                    Json(product.get("json_data")) if product.get("json_data") else None,
                     product.get("num_reviews"),
                     product.get("average_rating"),
+                    product.get("made_in_canada"),
+                    product.get("made_in_canada_reason"),
                     source_site,
                     embedding_str,
                 ),
@@ -338,7 +372,8 @@ class DatabaseManager:
                     
             except Exception as e:
                 failed += 1
-                log.warning(f"⚠️  Failed to save product {product.get('url', 'unknown')[:50]}: {str(e)[:100]}")
+                log.warning(f"⚠️  Failed to save product {product.get('url', 'unknown')[:50]}")
+                log.warning(f"Error: {str(e)}")
                 
                 # If we're getting too many failures, add a longer pause
                 if failed > 5 and failed % 5 == 0:
@@ -383,8 +418,11 @@ class Product:
     images: List[str] = None
     html: Optional[str] = None  # Raw HTML of the product page
     markdown: Optional[str] = None  # Markdown version of the product page
+    json_data: Optional[Dict[str, Any]] = None  # Raw JSON data from .json endpoint
     num_reviews: Optional[int] = None  # Number of reviews
     average_rating: Optional[float] = None  # Average rating (typically 1-5)
+    made_in_canada: Optional[bool] = None  # Whether the product is made in Canada
+    made_in_canada_reason: Optional[str] = None  # AI justification for made_in_canada classification
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -399,8 +437,11 @@ class Product:
             "images": self.images or [],
             "html": self.html,
             "markdown": self.markdown,
+            "json_data": self.json_data,
             "num_reviews": self.num_reviews,
             "average_rating": self.average_rating,
+            "made_in_canada": self.made_in_canada,
+            "made_in_canada_reason": self.made_in_canada_reason,
         }
 
 
@@ -417,6 +458,25 @@ async def fetch_text(client: httpx.AsyncClient, url: str, timeout: float = 30) -
         log.error(f"❌ Error fetching {url}: {e}")
         return None
 
+async def fetch_json(client: httpx.AsyncClient, url: str, timeout: float = 30) -> Optional[Dict[str, Any]]:
+    """Fetch JSON data from a product URL (Shopify .json endpoint)."""
+    try:
+        json_url = url + '.json'
+        r = await client.get(json_url, timeout=timeout, follow_redirects=True)
+        r.raise_for_status()
+        data = r.json()
+        log.debug(f"📋 Fetched JSON data from {json_url}")
+        return data
+    except httpx.HTTPStatusError as e:
+        # 404 is expected for non-Shopify sites, don't log as error
+        if e.response.status_code == 404:
+            log.debug(f"ℹ️ No .json endpoint for {url} (404)")
+        else:
+            log.debug(f"⚠️ HTTP {e.response.status_code} fetching {url}.json")
+        return None
+    except Exception as e:
+        log.debug(f"⚠️ Error fetching JSON for {url}: {e}")
+        return None
 
 async def fetch_markdown(client: httpx.AsyncClient, url: str, timeout: float = 30) -> Optional[str]:
     """Fetch markdown version of a URL using pure.md API"""
@@ -865,6 +925,118 @@ def pick_best_product_schema(schemas: List[Dict[str, Any]]) -> Optional[Dict[str
     return scored[0][1]
 
 
+async def detect_made_in_canada(html: str, markdown: Optional[str] = None, url: str = "") -> Tuple[Optional[bool], Optional[str]]:
+    """
+    Detect if a product is made in Canada using AI (GPT-5-nano).
+    
+    Analyzes the product page content to determine:
+    - True: Product is explicitly made/manufactured in Canada
+    - False: Product is made elsewhere or no indication of Canadian manufacturing
+    - None: Unable to determine (AI call failed)
+    
+    Returns:
+        Tuple of (made_in_canada: bool | None, reason: str | None)
+    """
+    if not openai_available:
+        log.warning("⚠️ OpenAI not available. Install with: uv add openai")
+        return None, None
+    
+    openai_api_key = config("OPENAI_API_KEY", default=None)
+    if not openai_api_key:
+        log.warning("⚠️ OPENAI_API_KEY not set. Skipping Made in Canada detection.")
+        return None, None
+    
+    # Use markdown if available (cleaner), otherwise extract text from HTML
+    if markdown:
+        content = markdown[:MAX_AI_DETECTION_LEN]  # Limit to ~8k chars to stay within token limits
+    else:
+        # Extract text from HTML
+        soup = BeautifulSoup(html, "html.parser")
+        # Remove script and style elements
+        for script in soup(["script", "style", "nav", "footer", "header"]):
+            script.decompose()
+        content = soup.get_text(separator=" ", strip=True)[:MAX_AI_DETECTION_LEN]
+    
+    if not content or len(content) < 50:
+        log.debug(f"   ℹ️ Not enough content to analyze for {url}")
+        return None, None
+    
+    prompt = f"""Analyze this product page content and determine if this product is MADE IN CANADA.
+
+Look for explicit statements like:
+- "Made in Canada"
+- "Manufactured in Canada"  
+- "Canadian made"
+- "Fabriqué au Canada"
+- "Crafted/Sewn/Assembled in Canada"
+
+Important distinctions:
+- A Canadian COMPANY or BRAND does NOT mean the product is made in Canada
+- "Designed in Canada" does NOT mean made in Canada
+- Look for manufacturing/production location, not company headquarters
+
+Respond in this exact format:
+ANSWER: YES or NO or UNKNOWN
+REASON: Brief explanation (1-2 sentences) of why you made this determination
+
+Product page content:
+{content}"""
+
+    try:
+        client = AsyncOpenAI(api_key=openai_api_key)
+        response = await client.chat.completions.create(
+            model=MADE_IN_CANADA_MODEL,
+            messages=[
+                {"role": "system", "content": "You are an expert at analyzing product pages to determine country of manufacture. Be precise and only say YES if there's explicit evidence the product is made in Canada. Always provide a brief reason for your determination."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Parse the response
+        answer = None
+        reason = None
+        
+        for line in response_text.split("\n"):
+            line = line.strip()
+            if line.upper().startswith("ANSWER:"):
+                answer_text = line[7:].strip().upper()
+                if "YES" in answer_text:
+                    answer = True
+                elif "NO" in answer_text:
+                    answer = False
+                # UNKNOWN stays as None
+            elif line.upper().startswith("REASON:"):
+                reason = line[7:].strip()
+        
+        # Fallback: try to parse old format if structured format failed
+        if answer is None and reason is None:
+            response_upper = response_text.upper()
+            if "YES" in response_upper:
+                answer = True
+                reason = response_text
+            elif "NO" in response_upper:
+                answer = False
+                reason = response_text
+        
+        if answer is True:
+            log.info(f"🍁 Made in Canada (AI) for {url}")
+            log.debug(f"   📝 Reason: {reason}")
+            return True, reason
+        elif answer is False:
+            log.debug(f"   ℹ️ NOT Made in Canada (AI) for {url}")
+            log.debug(f"   📝 Reason: {reason}")
+            return False, reason
+        else:
+            log.debug(f"   ❓ AI could not determine Made in Canada for {url}")
+            return None, reason
+            
+    except Exception as e:
+        log.warning(f"⚠️ AI Made in Canada detection failed for {url}: {e}")
+        return None, None
+
+
 def extract_reviews_from_html(html: str, url: str = "") -> Tuple[Optional[int], Optional[float]]:
     """
     Extract review count and average rating from HTML.
@@ -1027,6 +1199,8 @@ def parse_product_from_html(url: str, html: str, markdown: Optional[str] = None)
     p = Product(url=url, images=[], html=html, markdown=markdown)
     
     log.debug(f"🔍 Parsing product from {url[:60]}...")
+    
+    # Note: Made in Canada detection is done separately via AI in scrape_one()
     
     # Extract reviews
     p.num_reviews, p.average_rating = extract_reviews_from_html(html, url=url)
@@ -1225,10 +1399,11 @@ async def main():
 
         async def scrape_one(u: str):
             async with sem:
-                # Fetch HTML and markdown in parallel
+                # Fetch HTML, markdown, and JSON in parallel
                 html_task = fetch_text(client, u)
                 markdown_task = fetch_markdown(client, u)
-                html, markdown = await asyncio.gather(html_task, markdown_task)
+                json_task = fetch_json(client, u)
+                html, markdown, json_data = await asyncio.gather(html_task, markdown_task, json_task)
                 
                 await asyncio.sleep(WAIT_TIME_BETWEEN_REQUESTS)
                 if not html:
@@ -1246,7 +1421,15 @@ async def main():
                 if markdown:
                     log.debug(f"✅ Markdown found for {u}")
                 
+                if json_data:
+                    log.debug(f"📋 JSON data found for {u}")
+                
                 prod = parse_product_from_html(u, html, markdown=markdown)
+                prod.json_data = json_data  # Attach JSON data to product
+                
+                # Detect Made in Canada using AI
+                prod.made_in_canada, prod.made_in_canada_reason = await detect_made_in_canada(html, markdown, url=u)
+                
                 products.append(prod.to_dict())
 
         # Step 2: Scrape product pages
