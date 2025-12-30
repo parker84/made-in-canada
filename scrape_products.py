@@ -55,6 +55,65 @@ try:
 except ImportError:
     pass
 
+# Cohere is optional - only imported if --use-postgres is set (for embeddings)
+cohere_available = False
+try:
+    import cohere
+    cohere_available = True
+except ImportError:
+    pass
+
+# OpenAI is optional - used for AI-based Made in Canada detection
+openai_available = False
+try:
+    from openai import AsyncOpenAI
+    openai_available = True
+except ImportError:
+    pass
+
+# AI Model for Made in Canada detection
+MADE_IN_CANADA_MODEL = config("MADE_IN_CANADA_MODEL", default="gpt-5-nano")
+MAX_AI_DETECTION_LEN = 10000
+
+# Embedding Configuration
+EMBEDDING_MODEL = "embed-v4.0"
+EMBEDDING_DIMENSIONS = 1536
+
+# Sleep time on error
+SLEEP_TIME_ON_ERROR = 60*20 # 20 minutes
+WAIT_TIME_BETWEEN_REQUESTS = 10 # 10 seconds
+
+# Pure.md API for markdown conversion
+PUREMD_API_URL = "https://pure.md"
+PUREMD_API_KEY = config("PUREMD_API_KEY", default=None)
+PUREMD_HEADERS = {"x-puremd-api-token": PUREMD_API_KEY} if PUREMD_API_KEY else {}
+
+# Store type configurations - patterns for different ecommerce platforms
+STORE_CONFIGS = {
+    "shopify": {
+        "category_patterns": ["/collections/"],
+        "product_pattern": r"/products/[^/]+$",
+        "product_js": "href.includes('/products/')",
+    },
+    "roots": {
+        "category_patterns": ["/women/", "/men/", "/kids/", "/leather/", "/sale/", "/gifts/"],
+        "product_pattern": r"-\d+\.html",
+        "product_js": "/-\\d+\\.html/.test(href)",
+    },
+    "generic": {
+        "category_patterns": [
+            "/collections/", "/category/", "/categories/", "/shop/",
+            "/women/", "/men/", "/kids/", "/sale/", "/new/",
+            "/accessories/", "/clothing/", "/shoes/", "/bags/",
+        ],
+        "product_pattern": r"(/products/|/product/|-\d+\.html|/p/)",
+        "product_js": "href.includes('/products/') || href.includes('/product/') || /-\\d+\\.html/.test(href) || /\\/p\\/[^/]+/.test(href)",
+    },
+}
+
+# TODO: get this running for multiple brands (ex: airflow)
+# 1. on a schedule every day 
+
 
 # Set up colored logging
 def setup_logger() -> logging.Logger:
@@ -88,17 +147,29 @@ DB_CONFIG = {
 
 
 class DatabaseManager:
-    """Manages PostgreSQL database operations for products"""
+    """Manages PostgreSQL database operations for products with embeddings"""
     
     def __init__(self, db_config: Dict[str, str]):
         self.db_config = db_config
         self.conn = None
+        self.cohere_client = None
     
     async def connect(self):
-        """Connect to the database"""
+        """Connect to the database and initialize Cohere client"""
         if not psycopg_available:
-            log.error("❌ psycopg not installed. Run: uv add psycopg[binary]")
+            log.error("❌ psycopg not installed. Run: uv add 'psycopg[binary]'")
             sys.exit(1)
+        
+        if not cohere_available:
+            log.error("❌ cohere not installed. Run: uv add cohere")
+            sys.exit(1)
+        
+        # Initialize Cohere client for embeddings
+        cohere_api_key = config("COHERE_API_KEY", default="")
+        if not cohere_api_key:
+            log.error("❌ COHERE_API_KEY not set in environment")
+            sys.exit(1)
+        self.cohere_client = cohere.AsyncClientV2(api_key=cohere_api_key)
         
         log.info("🔌 Connecting to database...")
         start = time.time()
@@ -115,8 +186,11 @@ class DatabaseManager:
         start = time.time()
         
         async with self.conn.cursor() as cur:
-            # Create products table
-            await cur.execute("""
+            # Enable pgvector extension
+            await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            
+            # Create products table with embedding column
+            await cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS products (
                     id SERIAL PRIMARY KEY,
                     url TEXT UNIQUE NOT NULL,
@@ -128,11 +202,50 @@ class DatabaseManager:
                     currency TEXT,
                     availability TEXT,
                     images JSONB,
+                    html TEXT,
+                    markdown TEXT,
+                    json_data JSONB,
+                    num_reviews INTEGER,
+                    average_rating REAL,
+                    made_in_canada BOOLEAN,
+                    made_in_canada_reason TEXT,
                     source_site TEXT,
+                    embedding vector({EMBEDDING_DIMENSIONS}),
                     scraped_at TIMESTAMP DEFAULT NOW(),
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
+            """)
+            
+            # Add html column if it doesn't exist (for existing tables)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS html TEXT
+            """)
+            
+            # Add markdown column if it doesn't exist (for existing tables)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS markdown TEXT
+            """)
+            
+            # Add json_data column if it doesn't exist (for existing tables)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS json_data JSONB
+            """)
+            
+            # Add review columns if they don't exist (for existing tables)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS num_reviews INTEGER
+            """)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS average_rating REAL
+            """)
+            
+            # Add made_in_canada columns if they don't exist (for existing tables)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS made_in_canada BOOLEAN
+            """)
+            await cur.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS made_in_canada_reason TEXT
             """)
             
             # Create index on URL for fast lookups
@@ -145,18 +258,57 @@ class DatabaseManager:
                 CREATE INDEX IF NOT EXISTS products_source_site_idx ON products (source_site)
             """)
             
+            # Create vector index for similarity search
+            await cur.execute("""
+                CREATE INDEX IF NOT EXISTS products_embedding_idx 
+                ON products 
+                USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100)
+            """)
+            
             await self.conn.commit()
         
         elapsed = time.time() - start
         log.info(f"✅ Schema initialized in {elapsed:.2f}s")
     
+    async def generate_embedding(self, text: str) -> List[float]:
+        """Generate embedding for text using Cohere"""
+        response = await self.cohere_client.embed(
+            texts=[text],
+            model=EMBEDDING_MODEL,
+            input_type="search_document",
+            embedding_types=["float"],
+            output_dimension=int(EMBEDDING_DIMENSIONS),
+        )
+        return response.embeddings.float_[0]
+    
+    def _create_product_text(self, product: Dict[str, Any]) -> str:
+        """Create searchable text from product data for embedding"""
+        parts = []
+        if product.get("name"):
+            parts.append(f"Product: {product['name']}")
+        # if product.get("brand"):
+        #     parts.append(f"Brand: {product['brand']}")
+        if product.get("description"):
+            parts.append(f"Description: {product['description']}")
+        # if product.get("price"):
+        #     parts.append(f"Price: {product['price']} {product.get('currency', '')}")
+        product_text = " | ".join(parts) if parts else product.get("url", "")
+        log.info(f"Product text: {product_text}")
+        return product_text
+    
     async def save_product(self, product: Dict[str, Any], source_site: str) -> int:
-        """Save or update a product, return its ID"""
+        """Save or update a product with embedding, return its ID"""
+        # Generate embedding for the product
+        product_text = self._create_product_text(product)
+        embedding = await self.generate_embedding(product_text)
+        embedding_str = '[' + ','.join(str(x) for x in embedding) + ']'
+        
         async with self.conn.cursor() as cur:
             await cur.execute(
                 """
-                INSERT INTO products (url, name, brand, sku, description, price, currency, availability, images, source_site, scraped_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                INSERT INTO products (url, name, brand, sku, description, price, currency, availability, images, html, markdown, json_data, num_reviews, average_rating, made_in_canada, made_in_canada_reason, source_site, embedding, scraped_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, NOW(), NOW())
                 ON CONFLICT (url) DO UPDATE SET
                     name = EXCLUDED.name,
                     brand = EXCLUDED.brand,
@@ -166,6 +318,14 @@ class DatabaseManager:
                     currency = EXCLUDED.currency,
                     availability = EXCLUDED.availability,
                     images = EXCLUDED.images,
+                    html = EXCLUDED.html,
+                    markdown = EXCLUDED.markdown,
+                    json_data = EXCLUDED.json_data,
+                    num_reviews = EXCLUDED.num_reviews,
+                    average_rating = EXCLUDED.average_rating,
+                    made_in_canada = EXCLUDED.made_in_canada,
+                    made_in_canada_reason = EXCLUDED.made_in_canada_reason,
+                    embedding = EXCLUDED.embedding,
                     scraped_at = NOW(),
                     updated_at = NOW()
                 RETURNING id
@@ -180,7 +340,15 @@ class DatabaseManager:
                     product.get("currency"),
                     product.get("availability"),
                     Json(product.get("images", [])),
+                    product.get("html"),
+                    product.get("markdown"),
+                    Json(product.get("json_data")) if product.get("json_data") else None,
+                    product.get("num_reviews"),
+                    product.get("average_rating"),
+                    product.get("made_in_canada"),
+                    product.get("made_in_canada_reason"),
                     source_site,
+                    embedding_str,
                 ),
             )
             result = await cur.fetchone()
@@ -188,14 +356,33 @@ class DatabaseManager:
             return result[0]
     
     async def save_products_batch(self, products: List[Dict[str, Any]], source_site: str) -> int:
-        """Save multiple products in a batch, return count saved"""
+        """Save multiple products in a batch with rate limiting for embedding API"""
         saved = 0
-        for product in products:
+        failed = 0
+        
+        for i, product in enumerate(products):
             try:
                 await self.save_product(product, source_site)
                 saved += 1
+                
+                # Rate limit: pause every 20 products to avoid API limits
+                if saved % 20 == 0:
+                    log.info(f"💾 Progress: {saved}/{len(products)} saved...")
+                    await asyncio.sleep(1)  # Brief pause to respect rate limits
+                    
             except Exception as e:
-                log.warning(f"⚠️  Failed to save product {product.get('url')}: {e}")
+                failed += 1
+                log.warning(f"⚠️  Failed to save product {product.get('url', 'unknown')[:50]}")
+                log.warning(f"Error: {str(e)}")
+                
+                # If we're getting too many failures, add a longer pause
+                if failed > 5 and failed % 5 == 0:
+                    log.warning(f"⚠️  Multiple failures ({failed}), pausing 5s to respect rate limits...")
+                    await asyncio.sleep(5)
+        
+        if failed > 0:
+            log.warning(f"⚠️  {failed} products failed to save (likely rate limiting or missing data)")
+        
         return saved
     
     async def get_product_count(self, source_site: str = None) -> int:
@@ -229,6 +416,13 @@ class Product:
     currency: Optional[str] = None
     availability: Optional[str] = None
     images: List[str] = None
+    html: Optional[str] = None  # Raw HTML of the product page
+    markdown: Optional[str] = None  # Markdown version of the product page
+    json_data: Optional[Dict[str, Any]] = None  # Raw JSON data from .json endpoint
+    num_reviews: Optional[int] = None  # Number of reviews
+    average_rating: Optional[float] = None  # Average rating (typically 1-5)
+    made_in_canada: Optional[bool] = None  # Whether the product is made in Canada
+    made_in_canada_reason: Optional[str] = None  # AI justification for made_in_canada classification
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -241,6 +435,13 @@ class Product:
             "currency": self.currency,
             "availability": self.availability,
             "images": self.images or [],
+            "html": self.html,
+            "markdown": self.markdown,
+            "json_data": self.json_data,
+            "num_reviews": self.num_reviews,
+            "average_rating": self.average_rating,
+            "made_in_canada": self.made_in_canada,
+            "made_in_canada_reason": self.made_in_canada_reason,
         }
 
 
@@ -253,7 +454,42 @@ async def fetch_text(client: httpx.AsyncClient, url: str, timeout: float = 30) -
         r = await client.get(url, timeout=timeout, follow_redirects=True)
         r.raise_for_status()
         return r.text
-    except Exception:
+    except Exception as e:
+        log.error(f"❌ Error fetching {url}: {e}")
+        return None
+
+async def fetch_json(client: httpx.AsyncClient, url: str, timeout: float = 30) -> Optional[Dict[str, Any]]:
+    """Fetch JSON data from a product URL (Shopify .json endpoint)."""
+    try:
+        json_url = url + '.json'
+        r = await client.get(json_url, timeout=timeout, follow_redirects=True)
+        r.raise_for_status()
+        data = r.json()
+        log.debug(f"📋 Fetched JSON data from {json_url}")
+        return data
+    except httpx.HTTPStatusError as e:
+        # 404 is expected for non-Shopify sites, don't log as error
+        if e.response.status_code == 404:
+            log.debug(f"ℹ️ No .json endpoint for {url} (404)")
+        else:
+            log.debug(f"⚠️ HTTP {e.response.status_code} fetching {url}.json")
+        return None
+    except Exception as e:
+        log.debug(f"⚠️ Error fetching JSON for {url}: {e}")
+        return None
+
+async def fetch_markdown(client: httpx.AsyncClient, url: str, timeout: float = 30) -> Optional[str]:
+    """Fetch markdown version of a URL using pure.md API"""
+    try:
+        puremd_url = f"{PUREMD_API_URL}/{url}"
+        r = await client.get(puremd_url, timeout=timeout, headers=PUREMD_HEADERS)
+        if r.status_code == 200:
+            return r.text
+        else:
+            log.debug(f"⚠️  pure.md returned {r.status_code} for {url}")
+            return None
+    except Exception as e:
+        log.debug(f"⚠️  Error fetching markdown for {url}: {e}")
         return None
 
 
@@ -396,16 +632,24 @@ async def collect_product_urls(
 
 async def discover_categories_with_browser(
     base_url: str,
+    category_patterns: List[str],
     headless: bool = True,
 ) -> List[str]:
     """
     Discover category page URLs from the homepage navigation.
+    
+    Args:
+        base_url: The homepage URL
+        category_patterns: List of URL patterns that indicate category pages (e.g. ["/collections/", "/women/"])
+        headless: Whether to run browser in headless mode
     """
     if not playwright_available:
         log.error("❌ Playwright not installed. Run: uv add playwright && playwright install firefox")
         sys.exit(1)
     
     categories: Set[str] = set()
+    # Convert patterns to JSON for JavaScript
+    patterns_json = json.dumps(category_patterns)
     
     async with async_playwright() as p:
         browser = await p.firefox.launch(headless=headless)
@@ -421,22 +665,33 @@ async def discover_categories_with_browser(
             await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(2)
             
-            # Find category links (URLs ending with / that look like categories)
-            links = await page.evaluate("""
-                () => Array.from(document.querySelectorAll('a[href]'))
-                    .map(a => a.href)
-                    .filter(href => 
-                        href.endsWith('/') && 
-                        !href.includes('?') &&
-                        (href.includes('/women/') || 
-                         href.includes('/men/') || 
-                         href.includes('/kids/') ||
-                         href.includes('/leather/') ||
-                         href.includes('/sale/') ||
-                         href.includes('/made-in-canada') ||
-                         href.includes('/gender-free/') ||
-                         href.includes('/gifts/'))
-                    )
+            # Find category links using provided patterns
+            links = await page.evaluate(f"""
+                () => {{
+                    const categoryPatterns = {patterns_json};
+                    const links = new Set();
+                    const allLinks = Array.from(document.querySelectorAll('a[href]'));
+                    
+                    for (const a of allLinks) {{
+                        const href = a.href;
+                        
+                        // Skip external links, anchors, query params
+                        if (!href.startsWith(window.location.origin)) continue;
+                        if (href.includes('#')) continue;
+                        if (href.includes('?')) continue;
+                        if (href === window.location.origin + '/') continue;
+                        
+                        // Check if URL matches any category pattern
+                        const hrefLower = href.toLowerCase();
+                        if (categoryPatterns.some(p => hrefLower.includes(p.toLowerCase()))) {{
+                            // For /collections/, exclude product pages
+                            if (href.includes('/collections/') && href.includes('/products/')) continue;
+                            links.add(href);
+                        }}
+                    }}
+                    
+                    return Array.from(links);
+                }}
             """)
             
             for link in links:
@@ -454,6 +709,7 @@ async def discover_categories_with_browser(
 
 async def crawl_category_with_browser(
     category_urls: List[str],
+    product_js_filter: str,
     url_regex: str = "",
     max_load_more: int = 20,
     headless: bool = True,
@@ -463,6 +719,15 @@ async def crawl_category_with_browser(
     """
     Use Playwright to crawl category pages, click Load More to get all products,
     and extract product URLs.
+    
+    Args:
+        category_urls: List of category page URLs to crawl
+        product_js_filter: JavaScript expression to identify product links (e.g. "href.includes('/products/')")
+        url_regex: Optional regex to further filter URLs
+        max_load_more: Max scroll attempts
+        headless: Run browser headlessly
+        debug_screenshots: Save debug screenshots
+        out_dir: Output directory
     """
     if not playwright_available:
         log.error("❌ Playwright not installed. Run: uv add playwright && playwright install firefox")
@@ -541,37 +806,43 @@ async def crawl_category_with_browser(
                     
                     last_height = new_height
                 
-                # Extract product links - look for product tiles specifically
-                links = await page.evaluate("""
-                    () => {
+                # Extract product links using the configured filter
+                links = await page.evaluate(f"""
+                    () => {{
                         const links = new Set();
-                        
-                        // Get ALL links on the page
                         const allLinks = document.querySelectorAll('a[href]');
                         
-                        allLinks.forEach(a => {
+                        allLinks.forEach(a => {{
                             const href = a.href;
-                            // Product URLs on Roots have pattern: -NUMBERS.html (may have query params after)
-                            if (/-\\d+\\.html/.test(href)) {
-                                // Strip query params to get clean product URL
+                            
+                            // Apply the store-specific product filter
+                            if ({product_js_filter}) {{
                                 const cleanUrl = href.split('?')[0];
                                 links.add(cleanUrl);
-                            }
-                        });
+                            }}
+                        }});
                         
                         return Array.from(links);
-                    }
+                    }}
                 """)
                 
                 # Debug: show sample links found
                 if not links:
-                    all_html_links = await page.evaluate("""
-                        () => Array.from(document.querySelectorAll('a[href*=".html"]'))
-                            .slice(0, 10)
+                    # Get sample links to help debug
+                    sample_links = await page.evaluate("""
+                        () => Array.from(document.querySelectorAll('a[href]'))
                             .map(a => a.href)
+                            .filter(href => href.startsWith(window.location.origin))
+                            .slice(0, 20)
                     """)
-                    if all_html_links:
-                        log.warning(f"   ⚠️  No product links found. Sample .html links: {all_html_links[:3]}")
+                    log.warning(f"   ⚠️  No product links found on this page.")
+                    if sample_links:
+                        # Look for anything that might be a product
+                        product_like = [l for l in sample_links if '/product' in l.lower()]
+                        if product_like:
+                            log.warning(f"   🔍 Found product-like URLs: {product_like[:3]}")
+                        else:
+                            log.debug(f"   🔍 Sample links: {sample_links[:5]}")
                 
                 before_count = len(product_urls)
                 for link in links:
@@ -654,17 +925,295 @@ def pick_best_product_schema(schemas: List[Dict[str, Any]]) -> Optional[Dict[str
     return scored[0][1]
 
 
-def parse_product_from_html(url: str, html: str) -> Product:
+async def detect_made_in_canada(html: str, markdown: Optional[str] = None, url: str = "") -> Tuple[Optional[bool], Optional[str]]:
+    """
+    Detect if a product is made in Canada using AI (GPT-5-nano).
+    
+    Analyzes the product page content to determine:
+    - True: Product is explicitly made/manufactured in Canada
+    - False: Product is made elsewhere or no indication of Canadian manufacturing
+    - None: Unable to determine (AI call failed)
+    
+    Returns:
+        Tuple of (made_in_canada: bool | None, reason: str | None)
+    """
+    if not openai_available:
+        log.warning("⚠️ OpenAI not available. Install with: uv add openai")
+        return None, None
+    
+    openai_api_key = config("OPENAI_API_KEY", default=None)
+    if not openai_api_key:
+        log.warning("⚠️ OPENAI_API_KEY not set. Skipping Made in Canada detection.")
+        return None, None
+    
+    # Use markdown if available (cleaner), otherwise extract text from HTML
+    if markdown:
+        content = markdown[:MAX_AI_DETECTION_LEN]  # Limit to ~8k chars to stay within token limits
+    else:
+        # Extract text from HTML
+        soup = BeautifulSoup(html, "html.parser")
+        # Remove script and style elements
+        for script in soup(["script", "style", "nav", "footer", "header"]):
+            script.decompose()
+        content = soup.get_text(separator=" ", strip=True)[:MAX_AI_DETECTION_LEN]
+    
+    if not content or len(content) < 50:
+        log.debug(f"   ℹ️ Not enough content to analyze for {url}")
+        return None, None
+    
+    prompt = f"""Analyze this product page content and determine if this product is MADE IN CANADA.
+
+Look for explicit statements like:
+- "Made in Canada"
+- "Manufactured in Canada"  
+- "Canadian made"
+- "Fabriqué au Canada"
+- "Crafted/Sewn/Assembled in Canada"
+
+Important distinctions:
+- A Canadian COMPANY or BRAND does NOT mean the product is made in Canada
+- "Designed in Canada" does NOT mean made in Canada
+- Look for manufacturing/production location, not company headquarters
+
+Respond in this exact format:
+ANSWER: YES or NO or UNKNOWN
+REASON: Brief explanation (1-2 sentences) of why you made this determination
+
+Product page content:
+{content}"""
+
+    try:
+        client = AsyncOpenAI(api_key=openai_api_key)
+        response = await client.chat.completions.create(
+            model=MADE_IN_CANADA_MODEL,
+            messages=[
+                {"role": "system", "content": "You are an expert at analyzing product pages to determine country of manufacture. Be precise and only say YES if there's explicit evidence the product is made in Canada. Always provide a brief reason for your determination."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Parse the response
+        answer = None
+        reason = None
+        
+        for line in response_text.split("\n"):
+            line = line.strip()
+            if line.upper().startswith("ANSWER:"):
+                answer_text = line[7:].strip().upper()
+                if "YES" in answer_text:
+                    answer = True
+                elif "NO" in answer_text:
+                    answer = False
+                # UNKNOWN stays as None
+            elif line.upper().startswith("REASON:"):
+                reason = line[7:].strip()
+        
+        # Fallback: try to parse old format if structured format failed
+        if answer is None and reason is None:
+            response_upper = response_text.upper()
+            if "YES" in response_upper:
+                answer = True
+                reason = response_text
+            elif "NO" in response_upper:
+                answer = False
+                reason = response_text
+        
+        if answer is True:
+            log.info(f"🍁 Made in Canada (AI) for {url}")
+            log.debug(f"   📝 Reason: {reason}")
+            return True, reason
+        elif answer is False:
+            log.debug(f"   ℹ️ NOT Made in Canada (AI) for {url}")
+            log.debug(f"   📝 Reason: {reason}")
+            return False, reason
+        else:
+            log.debug(f"   ❓ AI could not determine Made in Canada for {url}")
+            return None, reason
+            
+    except Exception as e:
+        log.warning(f"⚠️ AI Made in Canada detection failed for {url}: {e}")
+        return None, None
+
+
+def extract_reviews_from_html(html: str, url: str = "") -> Tuple[Optional[int], Optional[float]]:
+    """
+    Extract review count and average rating from HTML.
+    Supports multiple review formats:
+    - MetafieldReviews JS variable (Shopify/Stamped)
+    - Yotpo, Loox, Okendo metafields
+    - Schema.org AggregateRating
+    
+    Returns: (num_reviews, average_rating)
+    """
+    num_reviews = None
+    average_rating = None
+    source = None  # Track which pattern found the reviews
+    
+    log.debug(f"🔍 Searching for reviews in {url[:60]}...")
+    
+    # Pattern 1: MetafieldReviews JS variable (Stamped reviews)
+    # Example: MetafieldReviews = {"rating":{"scale_min":"1.0","scale_max":"5.0","value":"5.0"},"rating_count":6};
+    metafield_match = re.search(r'MetafieldReviews\s*=\s*(\{[^;]+\});?', html)
+    if metafield_match:
+        log.debug(f"   📋 Found MetafieldReviews variable, parsing...")
+        try:
+            data = json.loads(metafield_match.group(1))
+            log.debug(f"   📋 MetafieldReviews data: {data}")
+            if isinstance(data, dict):
+                if "rating_count" in data:
+                    num_reviews = int(data["rating_count"])
+                if "rating" in data and isinstance(data["rating"], dict):
+                    if "value" in data["rating"]:
+                        average_rating = float(data["rating"]["value"])
+                if num_reviews is not None or average_rating is not None:
+                    source = "MetafieldReviews (Stamped)"
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            log.debug(f"   ⚠️ Failed to parse MetafieldReviews: {e}")
+    
+    # Pattern 2: Yotpo metafields
+    # Example: MetafieldYotpoRating = "4.5"; MetafieldYotpoCount = "123";
+    if average_rating is None:
+        yotpo_rating = re.search(r'MetafieldYotpoRating\s*=\s*["\']?([0-9.]+)["\']?', html)
+        yotpo_count = re.search(r'MetafieldYotpoCount\s*=\s*["\']?(\d+)["\']?', html)
+        if yotpo_rating or yotpo_count:
+            log.debug(f"   📋 Found Yotpo metafields...")
+        if yotpo_rating:
+            try:
+                average_rating = float(yotpo_rating.group(1))
+                source = "Yotpo"
+            except ValueError:
+                pass
+        if yotpo_count:
+            try:
+                num_reviews = int(yotpo_count.group(1))
+                source = "Yotpo"
+            except ValueError:
+                pass
+    
+    # Pattern 3: Loox metafields
+    if average_rating is None:
+        loox_rating = re.search(r'MetafieldLooxRating\s*=\s*["\']?([0-9.]+)["\']?', html)
+        loox_count = re.search(r'MetafieldLooxCount\s*=\s*["\']?(\d+)["\']?', html)
+        if loox_rating or loox_count:
+            log.debug(f"   📋 Found Loox metafields...")
+        if loox_rating:
+            try:
+                average_rating = float(loox_rating.group(1))
+                source = "Loox"
+            except ValueError:
+                pass
+        if loox_count:
+            try:
+                num_reviews = int(loox_count.group(1))
+                source = "Loox"
+            except ValueError:
+                pass
+    
+    # Pattern 4: Okendo metafields
+    if average_rating is None:
+        okendo_rating = re.search(r'okendoProductReviewAverageValue\s*=\s*["\']?([0-9.]+)["\']?', html)
+        okendo_count = re.search(r'okendoProductReviewCount\s*=\s*["\']?(\d+)["\']?', html)
+        if okendo_rating or okendo_count:
+            log.debug(f"   📋 Found Okendo metafields...")
+        if okendo_rating:
+            try:
+                average_rating = float(okendo_rating.group(1))
+                source = "Okendo"
+            except ValueError:
+                pass
+        if okendo_count:
+            try:
+                num_reviews = int(okendo_count.group(1))
+                source = "Okendo"
+            except ValueError:
+                pass
+    
+    # Pattern 5: Schema.org AggregateRating in JSON-LD
+    if average_rating is None:
+        soup = BeautifulSoup(html, "html.parser")
+        json_ld_scripts = soup.find_all("script", attrs={"type": "application/ld+json"})
+        log.debug(f"   📋 Checking {len(json_ld_scripts)} JSON-LD scripts for AggregateRating...")
+        
+        for script in json_ld_scripts:
+            if not script.string:
+                continue
+            try:
+                data = json.loads(script.string)
+                
+                def find_aggregate_rating(obj):
+                    if isinstance(obj, dict):
+                        if obj.get("@type") == "AggregateRating" or "aggregateRating" in obj:
+                            rating_obj = obj if obj.get("@type") == "AggregateRating" else obj.get("aggregateRating", {})
+                            if isinstance(rating_obj, dict):
+                                return rating_obj
+                        for v in obj.values():
+                            result = find_aggregate_rating(v)
+                            if result:
+                                return result
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            result = find_aggregate_rating(item)
+                            if result:
+                                return result
+                    return None
+                
+                agg_rating = find_aggregate_rating(data)
+                if agg_rating:
+                    log.debug(f"   📋 Found AggregateRating: {agg_rating}")
+                    if "ratingValue" in agg_rating:
+                        try:
+                            average_rating = float(agg_rating["ratingValue"])
+                        except (ValueError, TypeError):
+                            pass
+                    if "reviewCount" in agg_rating:
+                        try:
+                            num_reviews = int(agg_rating["reviewCount"])
+                        except (ValueError, TypeError):
+                            pass
+                    elif "ratingCount" in agg_rating:
+                        try:
+                            num_reviews = int(agg_rating["ratingCount"])
+                        except (ValueError, TypeError):
+                            pass
+                    if average_rating or num_reviews:
+                        source = "Schema.org AggregateRating"
+                        break
+            except json.JSONDecodeError:
+                continue
+    
+    # Log the final result
+    if num_reviews is not None or average_rating is not None:
+        rating_str = f"{average_rating:.1f}⭐" if average_rating else "N/A"
+        reviews_str = f"{num_reviews} reviews" if num_reviews else "N/A"
+        log.info(f"⭐ Reviews found: {rating_str} ({reviews_str}) via {source}")
+    else:
+        log.debug(f"   ℹ️ No reviews found for this product")
+    
+    return num_reviews, average_rating
+
+
+def parse_product_from_html(url: str, html: str, markdown: Optional[str] = None) -> Product:
     soup = BeautifulSoup(html, "html.parser")
-    p = Product(url=url, images=[])
+    p = Product(url=url, images=[], html=html, markdown=markdown)
+    
+    log.debug(f"🔍 Parsing product from {url[:60]}...")
+    
+    # Note: Made in Canada detection is done separately via AI in scrape_one()
+    
+    # Extract reviews
+    p.num_reviews, p.average_rating = extract_reviews_from_html(html, url=url)
 
     schemas = extract_json_ld_products(html)
     schema = pick_best_product_schema(schemas)
+    log.debug(f"   📋 Found {len(schemas)} JSON-LD Product schemas")
 
     if schema:
         p.name = schema.get("name")
         p.description = schema.get("description")
         p.sku = schema.get("sku")
+        log.debug(f"   📦 Product name: {p.name[:50] if p.name else 'N/A'}...")
 
         brand = schema.get("brand")
         if isinstance(brand, dict):
@@ -676,8 +1225,15 @@ def parse_product_from_html(url: str, html: str) -> Product:
         img = schema.get("image")
         if isinstance(img, str):
             p.images.append(img)
+            log.debug(f"   🖼️ Found 1 image from JSON-LD (string)")
         elif isinstance(img, list):
-            p.images.extend([x for x in img if isinstance(x, str)])
+            valid_imgs = [x for x in img if isinstance(x, str)]
+            p.images.extend(valid_imgs)
+            log.debug(f"   🖼️ Found {len(valid_imgs)} images from JSON-LD (list)")
+        elif img:
+            log.debug(f"   ⚠️ Image field has unexpected type: {type(img)}")
+        else:
+            log.debug(f"   ℹ️ No image field in JSON-LD schema")
 
         offers = schema.get("offers")
         # offers can be dict or list
@@ -692,6 +1248,7 @@ def parse_product_from_html(url: str, html: str) -> Product:
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
             p.name = og_title["content"].strip()
+            log.debug(f"   📦 Product name (from og:title): {p.name[:50]}...")
 
     if not p.description:
         og_desc = soup.find("meta", property="og:description")
@@ -703,6 +1260,9 @@ def parse_product_from_html(url: str, html: str) -> Product:
         og_img = soup.find("meta", property="og:image")
         if og_img and og_img.get("content"):
             p.images.append(og_img["content"].strip())
+            log.debug(f"   🖼️ Found 1 image from og:image fallback")
+        else:
+            log.debug(f"   ⚠️ No og:image meta tag found")
 
     # De-dupe images
     seen = set()
@@ -711,7 +1271,16 @@ def parse_product_from_html(url: str, html: str) -> Product:
         if i and i not in seen:
             imgs.append(i)
             seen.add(i)
+    
+    dupes_removed = len(p.images) - len(imgs)
     p.images = imgs
+    
+    # Final image summary
+    if p.images:
+        log.info(f"🖼️ Extracted {len(p.images)} image(s) for '{p.name[:40] if p.name else 'Unknown'}...' {f'({dupes_removed} duplicates removed)' if dupes_removed else ''}")
+        log.debug(f"   🖼️ First image: {p.images[0][:80]}...")
+    else:
+        log.debug(f"   ❌ No images found for this product")
 
     return p
 
@@ -740,7 +1309,6 @@ async def main():
     ap.add_argument("--pattern", default="/", help="URL substring to filter (default: '/' matches all)")
     ap.add_argument("--limit", type=int, default=0, help="Limit number of products (0 = no limit)")
     ap.add_argument("--concurrency", type=int, default=6, help="Concurrent requests")
-    ap.add_argument("--delay", type=float, default=0.3, help="Delay between requests per worker (seconds)")
     ap.add_argument("--download-images", action="store_true", help="Download images locally")
     ap.add_argument("--url-regex", default="", help="Regex to filter discovered URLs (applied after --pattern)")
     ap.add_argument("--dump-urls", action="store_true", help="Dump all discovered URLs to a file before filtering")
@@ -750,7 +1318,12 @@ async def main():
     ap.add_argument("--max-categories", type=int, default=0, help="Max categories to crawl (0 = all)")
     ap.add_argument("--debug-screenshots", action="store_true", help="Save screenshots of crawled pages for debugging")
     ap.add_argument("--use-postgres", action="store_true", help="Save products to PostgreSQL instead of JSON file")
+    ap.add_argument("--store-type", choices=["shopify", "roots", "generic"], default="generic",
+                    help="Store type for auto-detection patterns (default: generic)")
     args = ap.parse_args()
+    
+    # Get store configuration
+    store_config = STORE_CONFIGS[args.store_type]
 
     base = args.base.rstrip("/")
     out_dir = args.out
@@ -769,13 +1342,14 @@ async def main():
             
             # Auto-discover categories if none specified
             if not category_urls:
-                log.info(f"🔍 [1/3] Auto-discovering category pages from {base} ...")
+                log.info(f"🔍 [1/3] Auto-discovering category pages from {base} (store type: {args.store_type}) ...")
                 category_urls = await discover_categories_with_browser(
                     base,
+                    category_patterns=store_config["category_patterns"],
                     headless=not args.show_browser
                 )
                 if not category_urls:
-                    log.error("❌ No category pages found. Try specifying them with --category-urls")
+                    log.error("❌ No category pages found. Try specifying them with --category-urls or a different --store-type")
                     sys.exit(1)
             
             # Apply max-categories limit
@@ -784,8 +1358,9 @@ async def main():
             
             log.info(f"🌐 Crawling {len(category_urls)} category pages with browser ...")
             urls = await crawl_category_with_browser(
-                category_urls, 
-                args.url_regex,
+                category_urls,
+                product_js_filter=store_config["product_js"],
+                url_regex=args.url_regex,
                 headless=not args.show_browser,
                 debug_screenshots=args.debug_screenshots,
                 out_dir=out_dir,
@@ -824,11 +1399,37 @@ async def main():
 
         async def scrape_one(u: str):
             async with sem:
-                html = await fetch_text(client, u)
-                await asyncio.sleep(args.delay)
+                # Fetch HTML, markdown, and JSON in parallel
+                html_task = fetch_text(client, u)
+                markdown_task = fetch_markdown(client, u)
+                json_task = fetch_json(client, u)
+                html, markdown, json_data = await asyncio.gather(html_task, markdown_task, json_task)
+                
+                await asyncio.sleep(WAIT_TIME_BETWEEN_REQUESTS)
                 if not html:
-                    return
-                prod = parse_product_from_html(u, html)
+                    log.info(f"No HTML found for {u}, sleeping for {SLEEP_TIME_ON_ERROR} seconds and retrying...")
+                    await asyncio.sleep(SLEEP_TIME_ON_ERROR)
+                    html = await fetch_text(client, u)
+                    if not html:
+                        log.warning(f"❌ No HTML found for {u}")
+                        return
+                    else:
+                        log.debug(f"✅ HTML found for {u}")
+                else:
+                    log.debug(f"✅ HTML found for {u}")
+                
+                if markdown:
+                    log.debug(f"✅ Markdown found for {u}")
+                
+                if json_data:
+                    log.debug(f"📋 JSON data found for {u}")
+                
+                prod = parse_product_from_html(u, html, markdown=markdown)
+                prod.json_data = json_data  # Attach JSON data to product
+                
+                # Detect Made in Canada using AI
+                prod.made_in_canada, prod.made_in_canada_reason = await detect_made_in_canada(html, markdown, url=u)
+                
                 products.append(prod.to_dict())
 
         # Step 2: Scrape product pages
@@ -848,6 +1449,12 @@ async def main():
 
         products.sort(key=lambda x: x.get("url", ""))
         
+        # Filter out products without useful data (no name = likely failed parse)
+        valid_products = [p for p in products if p.get("name")]
+        skipped = len(products) - len(valid_products)
+        if skipped > 0:
+            log.info(f"⏭️  Skipping {skipped} products without names (failed to parse product data)")
+        
         # Save to PostgreSQL or JSON file
         if args.use_postgres:
             db = DatabaseManager(DB_CONFIG)
@@ -855,16 +1462,17 @@ async def main():
             await db.initialize_schema()
             
             source_site = urlparse(base).netloc
-            saved_count = await db.save_products_batch(products, source_site)
+            log.info(f"💾 Saving {len(valid_products)} valid products to database...")
+            saved_count = await db.save_products_batch(valid_products, source_site)
             total_count = await db.get_product_count(source_site)
             await db.close()
             
-            log.info(f"💾 Saved {saved_count} products to PostgreSQL ({total_count} total for {source_site}) ⏱️  {step2_elapsed:.1f}s")
+            log.info(f"✅ Saved {saved_count} products to PostgreSQL ({total_count} total for {source_site}) ⏱️  {step2_elapsed:.1f}s")
         else:
             out_json = os.path.join(out_dir, "products.json")
             with open(out_json, "w", encoding="utf-8") as f:
-                json.dump(products, f, ensure_ascii=False, indent=2)
-            log.info(f"💾 Saved {len(products)} products -> {out_json} ⏱️  {step2_elapsed:.1f}s")
+                json.dump(valid_products, f, ensure_ascii=False, indent=2)
+            log.info(f"💾 Saved {len(valid_products)} products -> {out_json} ⏱️  {step2_elapsed:.1f}s")
 
         if args.download_images:
             # Step 3: Download images
@@ -884,7 +1492,7 @@ async def main():
                     path = os.path.join(img_dir, fname)
                     if await download_file(client, img_url, path):
                         ok += 1
-                    await asyncio.sleep(args.delay)
+                    await asyncio.sleep(WAIT_TIME_BETWEEN_REQUESTS)
             step3_elapsed = time.time() - step3_start
 
             log.info(f"🎉 Downloaded {ok} images -> {img_dir} ⏱️  {step3_elapsed:.1f}s")
