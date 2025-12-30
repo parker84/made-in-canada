@@ -20,10 +20,124 @@ import asyncio
 import coloredlogs
 import psycopg
 import cohere
+import re
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
 # Setup logging
 logger = logging.getLogger(__name__)
 coloredlogs.install(level=os.getenv("LOG_LEVEL", "INFO"), logger=logger)
+
+
+@dataclass
+class ParsedQuery:
+    """Parsed search query with extracted filters and intent"""
+    original: str  # Original query
+    intent: str  # Core search intent (product type, what they're looking for)
+    filters: Dict[str, Any]  # Extracted filters
+    
+    # Filter types
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    brand: Optional[str] = None
+    category: Optional[str] = None
+    made_in_canada_only: bool = False
+    min_rating: Optional[float] = None
+    
+    def to_search_query(self) -> str:
+        """Convert back to optimized search query for embedding"""
+        return self.intent
+
+
+def parse_query(query: str) -> ParsedQuery:
+    """
+    Parse user query to extract filters and core intent.
+    
+    Examples:
+        "hoodies under $100" → intent="hoodies", max_price=100
+        "Roots jackets made in canada" → intent="jackets", brand="Roots", made_in_canada_only=True
+        "warm winter boots 4+ stars" → intent="warm winter boots", min_rating=4.0
+    """
+    original = query
+    filters = {}
+    intent = query
+    
+    min_price = None
+    max_price = None
+    brand = None
+    category = None
+    min_rating = None
+    made_in_canada_only = query_wants_made_in_canada(query)
+    
+    # Extract price filters
+    # "under $100", "less than $50", "below 75"
+    under_match = re.search(r'(?:under|less than|below|max|<)\s*\$?(\d+(?:\.\d{2})?)', query, re.IGNORECASE)
+    if under_match:
+        max_price = float(under_match.group(1))
+        intent = re.sub(r'(?:under|less than|below|max|<)\s*\$?\d+(?:\.\d{2})?', '', intent, flags=re.IGNORECASE)
+        filters['max_price'] = max_price
+    
+    # "over $50", "more than $100", "above 200", "min $30"
+    over_match = re.search(r'(?:over|more than|above|min|>)\s*\$?(\d+(?:\.\d{2})?)', query, re.IGNORECASE)
+    if over_match:
+        min_price = float(over_match.group(1))
+        intent = re.sub(r'(?:over|more than|above|min|>)\s*\$?\d+(?:\.\d{2})?', '', intent, flags=re.IGNORECASE)
+        filters['min_price'] = min_price
+    
+    # Price range: "$50-$100", "$50 to $100"
+    range_match = re.search(r'\$?(\d+(?:\.\d{2})?)\s*[-–to]+\s*\$?(\d+(?:\.\d{2})?)', query, re.IGNORECASE)
+    if range_match:
+        min_price = float(range_match.group(1))
+        max_price = float(range_match.group(2))
+        intent = re.sub(r'\$?\d+(?:\.\d{2})?\s*[-–to]+\s*\$?\d+(?:\.\d{2})?', '', intent, flags=re.IGNORECASE)
+        filters['min_price'] = min_price
+        filters['max_price'] = max_price
+    
+    # Extract rating filter: "4+ stars", "4.5 stars", "highly rated"
+    rating_match = re.search(r'(\d+(?:\.\d)?)\+?\s*(?:stars?|rating)', query, re.IGNORECASE)
+    if rating_match:
+        min_rating = float(rating_match.group(1))
+        intent = re.sub(r'\d+(?:\.\d)?\+?\s*(?:stars?|rating)', '', intent, flags=re.IGNORECASE)
+        filters['min_rating'] = min_rating
+    
+    # Extract known brand names
+    known_brands = [
+        "Roots", "Lululemon", "Canada Goose", "Aritzia", "Province of Canada",
+        "Mejuri", "Duer", "Reigning Champ", "Arc'teryx", "Mackage", "Moose Knuckles",
+        "Naked & Famous", "Wings+Horns", "Frank And Oak", "Tentree", "Kotn",
+        "Baffin", "Kamik", "Sorel", "Native Shoes"
+    ]
+    for b in known_brands:
+        if b.lower() in query.lower():
+            brand = b
+            filters['brand'] = brand
+            # Don't remove brand from intent - it helps with search
+            break
+    
+    # Clean up intent
+    # Remove "made in canada" phrases as they're handled by the filter
+    intent = re.sub(r'(?:made[- ]?in[- ]?canada|canadian[- ]?made|fabriqué au canada)', '', intent, flags=re.IGNORECASE)
+    
+    # Clean up extra whitespace
+    intent = ' '.join(intent.split()).strip()
+    
+    # If intent is now empty or too short, use original minus filter terms
+    if len(intent) < 3:
+        intent = original
+    
+    logger.debug(f"📝 Parsed query: intent='{intent}', filters={filters}")
+    
+    return ParsedQuery(
+        original=original,
+        intent=intent,
+        filters=filters,
+        min_price=min_price,
+        max_price=max_price,
+        brand=brand,
+        category=category,
+        made_in_canada_only=made_in_canada_only,
+        min_rating=min_rating,
+    )
 
 # ------------constants
 DEBUG_MODE = os.getenv("LOG_LEVEL", "INFO").upper() == "DEBUG"
@@ -36,12 +150,25 @@ AGENT_MODEL_ID = config("AGENT_MODEL_ID", default="gpt-5-nano")
 EMBEDDING_MODEL = "embed-v4.0"
 EMBEDDING_DIMENSIONS = 1536
 RERANK_MODEL = "rerank-v3.5"
-INITIAL_SEARCH_LIMIT = 50  # Fetch more results for re-ranking
-RERANK_TOP_N = 10  # Return top 10 after re-ranking
+
+# Funnel: 50 (hybrid) → 25 (rerank) → 10 (prompt selection)
+INITIAL_SEARCH_LIMIT = 50  # Hybrid search candidates
+RERANK_TOP_N = 25  # After re-ranking
+PROMPT_TOP_N = 10  # Final results to show
 
 # Lengths
-MAX_DESCRIPTION_LENGTH = 1000
-MAX_MARKDOWN_LENGTH = 1000
+MAX_DESCRIPTION_LENGTH = 500
+MAX_MARKDOWN_LENGTH = 500
+
+# Made in Canada ranking boost
+MADE_IN_CANADA_BOOST = 0.3  # Add 30% boost to hybrid score for Made in Canada products
+MADE_IN_CANADA_KEYWORDS = ["made in canada", "canadian made", "made-in-canada", "fabriqué au canada"]
+
+# Rating smoothing (Empirical Bayes)
+# Smooth DOWN ratings with few reviews to avoid over-trusting 5-star with 1 review
+RATING_PRIOR = 4.0  # Prior average rating (assume average product is ~4 stars)
+RATING_CONFIDENCE = 10  # Number of "virtual" prior reviews to add
+MIN_REVIEWS_FOR_TRUST = 10  # Below this, use the prior rating for ranking
 
 # Database Configuration
 DB_CONFIG = {
@@ -67,6 +194,178 @@ NUM_HISTORY_RUNS = 3
 
 
 # ------------Knowledge Base Functions
+def query_wants_made_in_canada(query: str) -> bool:
+    """Detect if the query is explicitly asking for Made in Canada products."""
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in MADE_IN_CANADA_KEYWORDS)
+
+
+def normalize_product_name(name: str) -> str:
+    """Normalize product name for deduplication comparison."""
+    if not name:
+        return ""
+    # Lowercase
+    name = name.lower()
+    
+    # Remove size variants (at end or in parentheses)
+    name = re.sub(r'\s*[-–]\s*(xs|s|m|l|xl|xxl|xxxl|os|one\s*size|small|medium|large|x-?large|xx-?large|size\s+\w+)\s*$', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'\s*\(\s*(xs|s|m|l|xl|xxl|xxxl|os|one\s*size|small|medium|large|x-?large|xx-?large|size\s+\w+)\s*\)\s*$', '', name, flags=re.IGNORECASE)
+    
+    # Remove ALL color words anywhere in the name (not just at end)
+    colors = r'\b(black|white|grey|gray|charcoal|navy|blue|red|green|brown|tan|beige|cream|ivory|pink|purple|orange|yellow|olive|burgundy|maroon|teal|coral|salmon|heather|oatmeal|natural|midnight|forest|hunter|sky|royal|slate|stone|sand|camel|cognac|rust|wine|plum|lavender|mint|sage|moss|cedar|walnut|mahogany|espresso|chocolate|mocha|latte|vanilla|snow|arctic|onyx|jet|raven|ink|graphite|pewter|silver|gold|bronze|copper|rose|blush|dusty|faded|washed|vintage)\b'
+    name = re.sub(colors, '', name, flags=re.IGNORECASE)
+    
+    # Remove gendered prefixes (men's, women's, kids, unisex, etc.)
+    name = re.sub(r"^(men'?s?|women'?s?|kid'?s?|unisex|ladies'?)\s+", '', name, flags=re.IGNORECASE)
+    
+    # Remove common modifier words
+    name = re.sub(r'\b(classic|original|premium|lightweight|heavyweight|printed|logo|slim|relaxed|oversized|fitted|regular|cropped|long|short)\b', '', name, flags=re.IGNORECASE)
+    
+    # Remove extra whitespace and clean up
+    name = ' '.join(name.split())
+    return name.strip()
+
+
+def extract_core_product_type(name: str) -> str:
+    """Extract the core product type for similarity matching."""
+    if not name:
+        return ""
+    name = name.lower()
+    # Common product types to extract
+    product_types = [
+        "hoodie", "hoody", "sweatshirt", "sweater", "jacket", "coat", "parka",
+        "t-shirt", "tee", "shirt", "polo", "tank", "top", "blouse",
+        "pants", "jeans", "shorts", "joggers", "leggings", "skirt", "dress",
+        "boots", "shoes", "sneakers", "sandals", "slippers",
+        "hat", "cap", "beanie", "toque", "scarf", "gloves", "mittens",
+        "bag", "backpack", "tote", "wallet", "belt",
+    ]
+    for pt in product_types:
+        if pt in name:
+            return pt
+    return ""
+
+
+def dedupe_results(results: list) -> list:
+    """
+    Remove duplicate products based on normalized name + brand.
+    Keeps the first (highest ranked) occurrence.
+    
+    Uses multiple strategies:
+    1. Normalized name + brand exact match
+    2. URL-based dedup (same product URL with variants)
+    3. Core product type + brand (e.g., only one "hoodie" from each brand)
+    
+    Args:
+        results: List of tuples from database (name at index 0, brand at index 1, url at index 5)
+    
+    Returns:
+        Deduplicated list
+    """
+    seen_names = set()
+    seen_urls = set()
+    seen_product_brand = {}  # brand -> set of product types already seen
+    deduped = []
+    
+    for row in results:
+        name = row[0] or ""
+        brand = row[1] or ""
+        url = row[5] if len(row) > 5 else ""
+        
+        # Strategy 1: Normalized name + brand exact match
+        norm_name = normalize_product_name(name)
+        name_key = f"{norm_name}|{brand.lower()}"
+        
+        # Strategy 2: URL-based dedup
+        url_base = re.sub(r'[?#].*$', '', url)  # Remove query params
+        url_base = re.sub(r'-?(xs|s|m|l|xl|xxl|xxxl)(?:-|$)', '', url_base, flags=re.IGNORECASE)
+        
+        # Strategy 3: Core product type + brand (limit one hoodie per brand, etc.)
+        product_type = extract_core_product_type(name)
+        brand_lower = brand.lower()
+        
+        # Check for duplicates
+        is_dup = False
+        dup_reason = ""
+        
+        if name_key in seen_names:
+            is_dup = True
+            dup_reason = "same normalized name"
+        elif url_base in seen_urls:
+            is_dup = True
+            dup_reason = "same URL base"
+        elif product_type and brand_lower:
+            # Check if we already have this product type from this brand
+            if brand_lower in seen_product_brand:
+                if product_type in seen_product_brand[brand_lower]:
+                    is_dup = True
+                    dup_reason = f"already have {product_type} from {brand}"
+        
+        if is_dup:
+            logger.debug(f"   🔄 Deduped: {name[:40]}... ({dup_reason})")
+            continue
+        
+        # Add to seen sets
+        seen_names.add(name_key)
+        seen_urls.add(url_base)
+        if product_type and brand_lower:
+            if brand_lower not in seen_product_brand:
+                seen_product_brand[brand_lower] = set()
+            seen_product_brand[brand_lower].add(product_type)
+        
+        deduped.append(row)
+    
+    if len(results) != len(deduped):
+        logger.info(f"🔄 Deduped {len(results)} → {len(deduped)} products")
+    
+    return deduped
+
+
+def smooth_rating_for_ranking(rating: Optional[float], num_reviews: Optional[int]) -> float:
+    """
+    Apply Empirical Bayes smoothing to ratings for ranking purposes.
+    
+    Smooths ratings DOWN towards the prior (4.0) when:
+    - There are few reviews (less trust in the rating)
+    - The rating is above the prior (we're skeptical of high ratings with few reviews)
+    
+    This prevents products with 5 stars and 1 review from outranking
+    products with 4.8 stars and 100 reviews.
+    
+    Args:
+        rating: The product's average rating (1-5 scale)
+        num_reviews: Number of reviews
+        
+    Returns:
+        Smoothed rating for ranking (not for display)
+    """
+    # If no rating data, return the prior
+    if rating is None:
+        return RATING_PRIOR
+    
+    # If too few reviews, just use the prior
+    if num_reviews is None or num_reviews < MIN_REVIEWS_FOR_TRUST:
+        logger.debug(f"   ⭐ Rating {rating:.1f} with {num_reviews or 0} reviews → using prior {RATING_PRIOR} for ranking")
+        return RATING_PRIOR
+    
+    # Only smooth DOWN, not up
+    # If the rating is already at or below the prior, keep it
+    if rating <= RATING_PRIOR:
+        return rating
+    
+    # Bayesian average: (C * prior + n * rating) / (C + n)
+    # This pulls high ratings down towards the prior when reviews are few
+    smoothed = (RATING_CONFIDENCE * RATING_PRIOR + num_reviews * rating) / (RATING_CONFIDENCE + num_reviews)
+    
+    # Don't smooth below the prior (only smooth down towards prior, not past it)
+    smoothed = max(smoothed, RATING_PRIOR)
+    
+    if smoothed < rating - 0.1:  # Only log if significant smoothing occurred
+        logger.debug(f"   ⭐ Rating {rating:.1f} ({num_reviews} reviews) → smoothed to {smoothed:.2f} for ranking")
+    
+    return smoothed
+
+
 async def generate_embedding(text: str) -> List[float]:
     """Generate embeddings for text using Cohere"""
     cohere_client = cohere.AsyncClientV2(api_key=config("COHERE_API_KEY"))
@@ -80,13 +379,14 @@ async def generate_embedding(text: str) -> List[float]:
     return response.embeddings.float_[0]
 
 
-async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N) -> list:
+async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N, prioritize_made_in_canada: bool = False) -> list:
     """Re-rank search results using Cohere's rerank model.
     
     Args:
         query: The user's search query
         results: List of tuples from database
         top_n: Number of top results to return after re-ranking
+        prioritize_made_in_canada: If True, sort Made in Canada products to the top after reranking
         
     Returns:
         Re-ranked list of tuples with rerank_score appended to each result
@@ -94,14 +394,27 @@ async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N) -
     if not results:
         return results
     
-    # TODO: let's rank things better (ex: pass in emp bayes smoothed ratings to the re-ranker, or rank again after the re-ranker based on ratings)
-    query = query + " | give higher relevance to products that are made in canada and products with high average ratings - but consider the number of reviews too (ex: 4.8 stars and 100 reviews is better than 5 stars and 1 reviews)"
+    # Enhance query for reranking
+    if prioritize_made_in_canada:
+        # Strong preference for Made in Canada when explicitly requested
+        rerank_query = query + " | CRITICAL: Only show products that are MADE IN CANADA. Products with Made in Canada: YES are extremely relevant. Products with Made in Canada: NO or UNKNOWN are not relevant."
+        logger.info("🍁 Prioritizing Made in Canada products (explicit request detected)")
+    else:
+        # Default preference - ratings are already smoothed in the documents
+        rerank_query = query + " | give higher relevance to products that are made in canada and products with higher smoothed ratings. Ratings have been smoothed to account for review count - trust the smoothed rating. Products with many reviews are more trustworthy."
     
-    # Create documents for re-ranking (combine name, brand, description)
+    # Create documents for re-ranking (combine name, brand, description, made_in_canada, reviews)
+    # Columns: name(0), brand(1), description(2), price(3), currency(4), url(5), source_site(6), 
+    #          similarity(7), markdown_content(8), hybrid_score(9), num_reviews(10), average_rating(11), 
+    #          images(12), made_in_canada(13), made_in_canada_reason(14)
     documents = []
     for row in results:
         name, brand, description, price, currency = row[0], row[1], row[2], row[3], row[4]
         markdown = row[8] if len(row) > 8 else None
+        num_reviews = row[10] if len(row) > 10 else None
+        average_rating = row[11] if len(row) > 11 else None
+        made_in_canada = row[13] if len(row) > 13 else None
+        made_in_canada_reason = row[14] if len(row) > 14 else None
         
         doc_text = f"Product Name: {name or ''} | Brand Name: {brand or ''}"
         if description:
@@ -110,6 +423,28 @@ async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N) -
             doc_text += f" | Markdown Content: {markdown[:MAX_MARKDOWN_LENGTH]}"
         if price:
             doc_text += f" | Price: {price} {currency or ''}"
+        # Add Made in Canada status and reason - emphasize this more
+        if made_in_canada is True:
+            doc_text += " | MADE IN CANADA: YES - VERIFIED CANADIAN MANUFACTURED"
+            if made_in_canada_reason:
+                doc_text += f" (Reason: {made_in_canada_reason})"
+        elif made_in_canada is False:
+            doc_text += " | Made in Canada: NO - NOT CANADIAN MADE"
+            if made_in_canada_reason:
+                doc_text += f" (Reason: {made_in_canada_reason})"
+        else:
+            doc_text += " | Made in Canada: UNKNOWN - UNVERIFIED"
+        
+        # Add reviews info for reranker using SMOOTHED rating for ranking
+        # This prevents products with 5 stars and 1 review from dominating
+        smoothed_rating = smooth_rating_for_ranking(average_rating, num_reviews)
+        review_count = num_reviews or 0
+        
+        # Simple format: Trust Score based on smoothed rating + review count
+        # Higher score = better quality signal
+        trust_score = smoothed_rating * min(1.0, review_count / 20)  # Scale by review count up to 20
+        doc_text += f" | Quality Score: {trust_score:.1f}/5 ({review_count} reviews)"
+        
         logger.debug(f"Document text: {doc_text}")
         documents.append(doc_text)
     
@@ -117,9 +452,9 @@ async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N) -
         cohere_client = cohere.AsyncClientV2(api_key=config("COHERE_API_KEY"))
         rerank_response = await cohere_client.rerank(
             model=RERANK_MODEL,
-            query=query,
+            query=rerank_query,
             documents=documents,
-            top_n=min(top_n, len(results)),
+            top_n=min(top_n * 2, len(results)),  # Get more results to filter
         )
         
         # Re-order results and append rerank score
@@ -129,6 +464,26 @@ async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N) -
             rerank_score = result.relevance_score
             # Append rerank_score to the tuple
             reranked_results.append((*results[original_idx], rerank_score))
+        
+        # If prioritizing Made in Canada, sort them to the top
+        if prioritize_made_in_canada:
+            # Sort by: (1) made_in_canada=True first, then (2) rerank_score descending
+            # made_in_canada is at index 13
+            def sort_key(row):
+                made_in_canada = row[13] if len(row) > 13 else None
+                rerank_score = row[-1] if row[-1] is not None else 0
+                # Return tuple: (not made_in_canada, -rerank_score)
+                # This puts True first (since not True = False < not False = True)
+                return (made_in_canada is not True, -rerank_score)
+            
+            reranked_results.sort(key=sort_key)
+            
+            # Count how many Made in Canada products we have
+            mic_count = sum(1 for r in reranked_results if r[13] is True)
+            logger.info(f"🍁 Found {mic_count} Made in Canada products out of {len(reranked_results)}")
+        
+        # Limit to top_n after sorting
+        reranked_results = reranked_results[:top_n]
         
         logger.info(f"🔄 Re-ranked {len(results)} results → top {len(reranked_results)}")
         return reranked_results
@@ -140,10 +495,18 @@ async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N) -
 
 
 async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
-    """Hybrid search (vector + lexical/FTS) then rerank."""
+    """
+    Hybrid search (vector + lexical/FTS) then rerank.
+    
+    Funnel: INITIAL_SEARCH_LIMIT → RERANK_TOP_N → PROMPT_TOP_N
+    """
     try:
-        # Generate embedding for the query
-        embedding = await generate_embedding(query)
+        # Parse query to extract filters and core intent
+        parsed = parse_query(query)
+        logger.info(f"📝 Query: '{parsed.intent}' | Filters: {parsed.filters}")
+        
+        # Generate embedding for the intent (cleaner than full query)
+        embedding = await generate_embedding(parsed.intent)
         embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
         # Tuning knobs
@@ -159,6 +522,34 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
             f"password={DB_CONFIG['password']}"
         )
 
+        # Build filter clauses from parsed query
+        wants_mic = parsed.made_in_canada_only
+        mic_filter = "AND p.made_in_canada = true" if wants_mic else ""
+        
+        # Build additional WHERE clauses for parsed filters
+        additional_filters = []
+        filter_params = []
+        
+        if parsed.min_price is not None:
+            additional_filters.append("AND CAST(NULLIF(regexp_replace(p.price, '[^0-9.]', '', 'g'), '') AS NUMERIC) >= %s")
+            filter_params.append(parsed.min_price)
+        if parsed.max_price is not None:
+            additional_filters.append("AND CAST(NULLIF(regexp_replace(p.price, '[^0-9.]', '', 'g'), '') AS NUMERIC) <= %s")
+            filter_params.append(parsed.max_price)
+        if parsed.min_rating is not None:
+            additional_filters.append("AND p.average_rating >= %s")
+            filter_params.append(parsed.min_rating)
+        if parsed.brand:
+            additional_filters.append("AND p.brand ILIKE %s")
+            filter_params.append(f"%{parsed.brand}%")
+        
+        extra_where = " ".join(additional_filters)
+        
+        if wants_mic:
+            logger.info("🍁 Filtering to Made in Canada products only (explicit request)")
+        if filter_params:
+            logger.info(f"🔍 Applied filters: {parsed.filters}")
+
         results = []
         async with await psycopg.AsyncConnection.connect(conn_string) as conn:
             async with conn.cursor() as cur:
@@ -167,7 +558,7 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                 # - Text candidates: uses Postgres FTS (to_tsvector/plainto_tsquery)
                 # - We normalize text rank to 0..1 across candidates, then blend with vector sim.
                 # - If you already have a precomputed tsvector column, swap the to_tsvector(...) with that column.
-                sql_query = """
+                sql_query = f"""
                     --sql
                     WITH
                     q AS (
@@ -190,10 +581,12 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                             p.markdown AS markdown_content,
                             p.num_reviews,
                             p.average_rating,
-                            p.images
+                            p.images,
+                            p.made_in_canada,
+                            p.made_in_canada_reason
                         FROM products p
                         CROSS JOIN q
-                        WHERE p.embedding IS NOT NULL
+                        WHERE p.embedding IS NOT NULL {mic_filter} {extra_where}
                         ORDER BY p.embedding <=> q.q_embedding
                         LIMIT %s
                     ),
@@ -219,14 +612,16 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                             p.markdown AS markdown_content,
                             p.num_reviews,
                             p.average_rating,
-                            p.images
+                            p.images,
+                            p.made_in_canada,
+                            p.made_in_canada_reason
                         FROM products p
                         CROSS JOIN q
                         WHERE q.q_ts @@ to_tsvector('english',
                             coalesce(p.name,'') || ' ' ||
                             coalesce(p.brand,'') || ' ' ||
                             coalesce(p.description,'')
-                        )
+                        ) {mic_filter} {extra_where}
                         ORDER BY text_rank DESC
                         LIMIT %s
                     ),
@@ -252,7 +647,9 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                             max(coalesce(text_rank, 0.0)) AS text_rank,
                             max(num_reviews) AS num_reviews,
                             max(average_rating) AS average_rating,
-                            max(images::text)::jsonb AS images
+                            max(images::text)::jsonb AS images,
+                            bool_or(made_in_canada) AS made_in_canada,
+                            max(made_in_canada_reason) AS made_in_canada_reason
                         FROM candidates
                         GROUP BY url
                     ),
@@ -285,7 +682,9 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                             markdown_content,
                             num_reviews,
                             average_rating,
-                            images
+                            images,
+                            made_in_canada,
+                            made_in_canada_reason
                         FROM deduped
                     )
 
@@ -299,29 +698,32 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                         source_site,
                         vector_similarity AS similarity,
                         markdown_content,
-                        (%s * vector_similarity_norm) + ((1 - %s) * text_rank_norm) AS hybrid_score,
+                        -- Add Made in Canada boost to hybrid score
+                        (%s * vector_similarity_norm) + ((1 - %s) * text_rank_norm) + 
+                        CASE WHEN made_in_canada = true THEN %s ELSE 0.0 END AS hybrid_score,
                         num_reviews,
                         average_rating,
-                        images
+                        images,
+                        made_in_canada,
+                        made_in_canada_reason
                     FROM scored
                     ORDER BY hybrid_score DESC
                     LIMIT %s
                     --end-sql
                 """
 
-                # Pull a combined candidate set (bigger than final limit) then rerank down.
-                await cur.execute(
-                    sql_query,
-                    (
-                        embedding_str,
-                        query,
-                        VECTOR_CANDIDATES,
-                        TEXT_CANDIDATES,
-                        ALPHA,  # for hybrid_score calculation
-                        ALPHA,  # for hybrid_score calculation
-                        HYBRID_CANDIDATES,
-                    ),
+                # Build parameters tuple - need to duplicate filter_params for both vec and txt CTEs
+                base_params = [embedding_str, parsed.intent]
+                vec_params = filter_params.copy()
+                txt_params = filter_params.copy()
+                
+                all_params = tuple(
+                    base_params + vec_params + [VECTOR_CANDIDATES] + 
+                    txt_params + [TEXT_CANDIDATES] +
+                    [ALPHA, ALPHA, MADE_IN_CANADA_BOOST, HYBRID_CANDIDATES]
                 )
+                
+                await cur.execute(sql_query, all_params)
                 results = await cur.fetchall()
 
         if results:
@@ -329,16 +731,39 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
             top_score = results[0][9] if results[0][9] is not None else 0.0
             logger.info(f"🔍 Found {len(results)} hybrid candidates (top hybrid score: {top_score:.2%})")
         else:
-            logger.warning(f"No products found. Try a different search query than '{query}'")
+            logger.warning(f"No products found. Try a different search query than '{parsed.intent}'")
             return "No products found in the knowledge base. Try a different search query."
 
-        # Rerank down to final limit (e.g., Cohere rerank)
-        results = await rerank_results(query, results, top_n=limit)
+        # Step 1: Deduplicate results (remove size/color variants)
+        results = dedupe_results(results)
+        
+        # Step 2: Rerank down to RERANK_TOP_N
+        results = await rerank_results(parsed.intent, results, top_n=RERANK_TOP_N, prioritize_made_in_canada=wants_mic)
+        
+        logger.info(f"📊 Funnel: {INITIAL_SEARCH_LIMIT} hybrid → {len(results)} reranked → prompt will select top {PROMPT_TOP_N}")
 
         # Format results - tuple now includes rerank_score at the end
         # Columns: name(0), brand(1), description(2), price(3), currency(4), url(5), source_site(6), 
-        #          similarity(7), markdown_content(8), hybrid_score(9), num_reviews(10), average_rating(11), images(12), rerank_score(13)
-        formatted_results = [f"Found {len(results)} products matching your query:\n"]
+        #          similarity(7), markdown_content(8), hybrid_score(9), num_reviews(10), average_rating(11), 
+        #          images(12), made_in_canada(13), made_in_canada_reason(14), rerank_score(15)
+        
+        # Build header with query context
+        header = f"""## Search Results for: "{parsed.original}"
+
+**Found {len(results)} candidate products** (showing top {min(len(results), RERANK_TOP_N)} by relevance)
+
+**Your task:** Review these {len(results)} products and SELECT THE TOP {PROMPT_TOP_N} to show the user.
+Prioritize products that:
+1. Best match the user's intent: "{parsed.intent}"
+2. Are Made in Canada (🍁) if relevant to the query
+3. Have good reviews and ratings
+4. Offer good value for price
+
+**Filters applied:** {parsed.filters if parsed.filters else 'None'}
+
+---
+"""
+        formatted_results = [header]
         for i, row in enumerate(results, 1):
             name = row[0]
             brand = row[1]
@@ -353,6 +778,8 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
             num_reviews = row[10]
             average_rating = row[11]
             images = row[12]  # JSONB array of image URLs
+            made_in_canada = row[13]  # Boolean or None
+            made_in_canada_reason = row[14] if len(row) > 14 else None  # AI justification
             rerank_score = row[-1]  # Last element is rerank_score
             
             formatted_results.append(f"### {i}. {name or 'Unknown Product'}")
@@ -368,6 +795,17 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                 formatted_results.append(f"\n\n**Brand:** {brand}")
             if price:
                 formatted_results.append(f"\n\n**Price:** `{price} {currency or ''}`")
+            
+            # Add Made in Canada status with reason
+            if made_in_canada is True:
+                reason_text = f" — {made_in_canada_reason}" if made_in_canada_reason else ""
+                formatted_results.append(f"\n\n**Made in Canada:** Yes{reason_text}")
+            elif made_in_canada is False:
+                reason_text = f" — {made_in_canada_reason}" if made_in_canada_reason else ""
+                formatted_results.append(f"\n\n**Made in Canada:** No{reason_text}")
+            else:
+                formatted_results.append(f"\n\n**Made in Canada:** Unknown")
+            
             # Add reviews section
             if average_rating is not None or num_reviews is not None:
                 rating_str = f"`{average_rating:.1f}`⭐" if average_rating else "N/A"
@@ -405,51 +843,121 @@ def search_products_sync(query: str, limit: int = 10) -> str:
 # ------------Agent Configuration
 def get_product_finding_instructions() -> str:
     """Get the instructions for the product finding agent"""
-    # TODO: we need to improve the data in the database + filtering abilities
-    # 1. actually made in canada or just a canadian company?
-    return dedent("""
+    return dedent(f"""
         You are an expert at finding Made in Canada products and Canadian-owned businesses.
         
         ALWAYS search the product knowledge base first using search_products_sync.
         
-        Here are the steps you need to follow:
+        ## SELECTION PROCESS
+        
+        The search will return ~25 candidate products ranked by relevance. 
+        YOUR JOB: Select and present only the TOP {PROMPT_TOP_N} BEST matches to the user.
+        
+        When selecting, prioritize:
+        1. **Relevance** - How well does it match what the user asked for?
+        2. **Made in Canada** - If user asked for Canadian products, prioritize 🍁 products
+        3. **Quality signals** - Good reviews (4+ stars with multiple reviews)
+        4. **Value** - Reasonable price for the product type
+        5. **Variety** - CRITICAL: Show diverse products, not the same item in different colors!
+        
+        ## ⚠️ STRICT DEDUPLICATION RULES
+        
+        NEVER show the same product twice in different colors or sizes!
+        
+        Examples of DUPLICATES to AVOID:
+        - "Flag Fleece Hoodie Black" AND "Flag Fleece Hoodie Navy" ❌ (same hoodie, different colors)
+        - "Classic T-Shirt - S" AND "Classic T-Shirt - XL" ❌ (same shirt, different sizes)
+        - "Men's Joggers" AND "Women's Joggers" ❌ (same product, different genders)
+        - "Heritage Fleece Hoodie" AND "Stanfield's Logo Heritage Fleece Hoodie" ❌ (same product, slightly different name)
+        
+        Instead: Pick the BEST ONE variant and move on to a DIFFERENT product.
+        
+        Goal: Show {PROMPT_TOP_N} UNIQUE products from different brands/styles
+        
+        ## STEPS TO FOLLOW
+        
         1. Search the product knowledge base for matching products
-        2. Present the results with product images and details
-        3. Highlight which products are Made in Canada vs Canadian-owned
-        4. Ask a follow-up question to help the user further
+        2. ANALYZE the ~25 results and mentally rank them
+        3. SELECT the TOP {PROMPT_TOP_N} best matches (not just the first 10!)
+        4. Present these {PROMPT_TOP_N} products with images and details
+        5. Ask a follow-up question
         
-        When presenting products, ALWAYS include ALL of these fields:
-        - Product image (displayed as markdown image)
-        - Product name and brand (REMOVE any sizing info like "- XS", "- S/M", "Size Large", "XXL", etc. from product names)
-        - Price (if available)
-        - Reviews - ALWAYS show rating and review count (e.g. "4.5⭐ (23 reviews)"). If no reviews, show "No reviews yet"
-        - Product description - ALWAYS include a brief description of the product
-        - Link to the product
-        - Relevance score (shown as percentage - this indicates how well the product matches the query)
-        - Whether it's Made in Canada
+        ## PRODUCT PRESENTATION
         
-        IMPORTANT: Clean up product names by removing size variants. For example:
+        For each of the {PROMPT_TOP_N} products you select, use this EXACT format:
+        
+        ## 1. Product Name Here 🍁
+        
+        ![Product Name](image_url)
+        
+        **Brand:** Brand Name  
+        **Price:** `$XX.XX CAD`  
+        **Reviews:** `4.5`⭐ (`23` reviews)  
+        **Description:** Brief product description here.  
+        **Link:** [View Product](url)  
+        **Relevance:** `92%`  
+        **Made in Canada:** 🍁 Yes
+        
+        ---
+        
+        Key points:
+        - Use ## (h2) for product name - MUST be a big header!
+        - Product name goes FIRST, then image below it
+        - REMOVE sizing info from names (e.g., "- XS", "Size Large")
+        - Add 🍁 to the header if Made in Canada
+        - Use --- between products for visual separation
+        
+        ## PRODUCT NAME HEADERS
+        
+        ALWAYS use ## (h2) for product names - they should be BIG and prominent:
+        
+        ## 1. Flag Fleece Hoodie 🍁
+        
+        NOT:
+        - "1. Flag Fleece Hoodie" (no header - too small!)
+        - "### 1. Flag Fleece Hoodie" (h3 - still too small!)
+        - "#### 1. Flag Fleece Hoodie" (h4 - way too small!)
+        
+        ## 🍁 MADE IN CANADA FORMATTING
+        
+        When a product has "Made in Canada: Yes":
+        - Add 🍁 next to the product name: "## 1. Classic Hoodie 🍁"
+        - Format as: "**Made in Canada:** 🍁 Yes"
+        
+        For NOT made in Canada: "**Made in Canada:** ❌ No"
+        For unknown: "**Made in Canada:** ❓ Unknown"
+        
+        ## NAME CLEANUP
+        
+        Remove size/color variants from names:
         - "Classic Hoodie - XS" → "Classic Hoodie"
         - "Cozy Sweater Size Medium" → "Cozy Sweater"
         - "T-Shirt Navy - L/XL" → "T-Shirt Navy"
         
-        Focus on Canadian brands like: Roots, Lululemon, Canada Goose, Aritzia, 
-        Province of Canada, Mejuri, Duer, etc.
+        ## FORMATTING
         
-        Present each product as a card with its image followed by details. The search results 
-        already include markdown-formatted images - preserve and display these images in your response.
-        
-        IMPORTANT FORMATTING: When displaying numbers to the user, wrap them in backticks for visual emphasis:
+        Wrap numbers in backticks:
         - Price: `\\$78.00 CAD`
-        - Score: `92%`
+        - Score: `92%`  
         - Rating: `4.5`⭐ (`23` reviews)
+
+        Image URL fix: If URL has double domain like "https://www.kamik.com//www.kamik.com/...", 
+        remove the duplicate.
         
-        NEVER skip the Reviews or Description fields - they help users make informed decisions.
-        If reviews are missing, show "No reviews yet". If description is missing, write a brief one based on the product name.
+        ## KEY REMINDERS
         
-        Sort products by Score descending (highest relevance first).
+        - Select the BEST {PROMPT_TOP_N}, not just the first 10
+        - **NEVER show color/size variants of the same product** - pick ONE and move on!
+        - If you see "Flag Hoodie Black" and "Flag Hoodie Navy", only show ONE
+        - Aim for variety: different brands, different product types
+        - NEVER skip Reviews or Description fields
+        - If reviews missing, show "No reviews yet"
+        - If description missing, write a brief one
+        - Sort YOUR selection by relevance (highest first)
+        - End with a meaningful follow-up question
         
-        At the end, ask the user a meaningful follow-up question.
+        Focus on Canadian brands: Roots, Lululemon, Canada Goose, Aritzia, 
+        Province of Canada, Mejuri, Duer, Reigning Champ, etc.
     """)
 
 
