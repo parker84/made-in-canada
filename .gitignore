@@ -215,3 +215,6 @@ images/
 
 # Streamlit secrets
 .streamlit/secrets.toml
+
+# Logs
+logs/

@@ -23,10 +23,123 @@ import cohere
 import re
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
+from urllib.parse import urlencode
 
 # Setup logging
 logger = logging.getLogger(__name__)
 coloredlogs.install(level=os.getenv("LOG_LEVEL", "INFO"), logger=logger)
+
+# Click tracking configuration
+TRACKING_ENABLED = config("TRACKING_ENABLED", default="true").lower() == "true"
+TRACKING_BASE_URL = config("TRACKING_BASE_URL", default="http://localhost:8000")
+
+
+class TrackingContext:
+    """
+    Stores tracking context (user_id, session_id) for click tracking.
+    
+    Set the context from your app before running the agent:
+        from team import tracking_context
+        tracking_context.set_context(user_id="user@example.com", session_id="abc-123")
+    
+    The context is then automatically used when creating tracked URLs.
+    """
+    
+    def __init__(self):
+        self._user_id: Optional[str] = None
+        self._session_id: Optional[str] = None
+        self._referrer: Optional[str] = None
+    
+    def set_context(
+        self,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        referrer: Optional[str] = None,
+    ):
+        """Set the tracking context for the current request/session"""
+        self._user_id = user_id
+        self._session_id = session_id
+        self._referrer = referrer
+        logger.debug(f"📊 Tracking context set: user={user_id}, session={session_id}")
+    
+    def clear_context(self):
+        """Clear the tracking context"""
+        self._user_id = None
+        self._session_id = None
+        self._referrer = None
+    
+    @property
+    def user_id(self) -> Optional[str]:
+        return self._user_id
+    
+    @property
+    def session_id(self) -> Optional[str]:
+        return self._session_id
+    
+    @property
+    def referrer(self) -> Optional[str]:
+        return self._referrer
+    
+    def create_tracked_url(
+        self,
+        url: str,
+        source: Optional[str] = None,
+        source_type: str = "product",
+        product_name: Optional[str] = None,
+        product_id: Optional[str] = None,
+    ) -> str:
+        """
+        Create a tracked URL that goes through the click tracking endpoint.
+        Automatically includes user_id, session_id, and referrer from context.
+        Adds UTM parameters automatically on redirect.
+        
+        If tracking is disabled, returns the original URL.
+        """
+        if not TRACKING_ENABLED:
+            return url
+        
+        params = {"url": url}
+        if source:
+            params["source"] = source
+        if source_type:
+            params["source_type"] = source_type
+        if product_name:
+            params["product_name"] = product_name[:100]  # Limit length for URL
+        if product_id:
+            params["product_id"] = product_id
+        if self._user_id:
+            params["user_id"] = self._user_id
+        if self._session_id:
+            params["session_id"] = self._session_id
+        if self._referrer:
+            params["referrer"] = self._referrer
+        
+        query = urlencode(params)
+        return f"{TRACKING_BASE_URL}/click?{query}"
+
+
+# Global tracking context instance - import and use from your app
+tracking_context = TrackingContext()
+
+
+def create_tracked_url(
+    url: str,
+    source: Optional[str] = None,
+    source_type: str = "product",
+    product_name: Optional[str] = None,
+    product_id: Optional[str] = None,
+) -> str:
+    """
+    Convenience function that uses the global tracking context.
+    Prefer using tracking_context.create_tracked_url() directly.
+    """
+    return tracking_context.create_tracked_url(
+        url=url,
+        source=source,
+        source_type=source_type,
+        product_name=product_name,
+        product_id=product_id,
+    )
 
 
 @dataclass
@@ -817,7 +930,15 @@ Prioritize products that:
             if markdown_content:
                 markdown_short = markdown_content[:MAX_MARKDOWN_LENGTH] + "..." if len(markdown_content) > MAX_MARKDOWN_LENGTH else markdown_content
                 formatted_results.append(f"\n\n**Raw Markdown Content:** {markdown_short}")
-            formatted_results.append(f"\n\n**Link:** [{url}]({url})")
+            
+            # Create tracked URL with UTM parameters
+            tracked_url = create_tracked_url(
+                url=url,
+                source=source_site,
+                source_type="product",
+                product_name=name,
+            )
+            formatted_results.append(f"\n\n**Link:** [View Product]({tracked_url})")
             formatted_results.append(f"\n\n**Source:** {source_site}")
             formatted_results.append("")
 
@@ -906,6 +1027,7 @@ def get_product_finding_instructions() -> str:
         - REMOVE sizing info from names (e.g., "- XS", "Size Large")
         - Add 🍁 to the header if Made in Canada
         - Use --- between products for visual separation
+        - **NEVER show raw URLs** - always use [View Product](url) or [Shop Now](url)
         
         ## PRODUCT NAME HEADERS
         
@@ -943,6 +1065,21 @@ def get_product_finding_instructions() -> str:
 
         Image URL fix: If URL has double domain like "https://www.kamik.com//www.kamik.com/...", 
         remove the duplicate.
+        
+        ## LINK FORMATTING
+        
+        ⚠️ NEVER display raw URLs to users! Always use friendly link text:
+        
+        ✅ GOOD:
+        - **Link:** [View Product](url)
+        - **Link:** [Shop Now](url)
+        - **Link:** [Buy on Roots](url)
+        
+        ❌ BAD:
+        - **Link:** https://www.roots.com/ca/en/some-product.html
+        - **Link:** [https://www.roots.com/...](url)
+        
+        The URLs in the search results are tracking links - use them as-is but with friendly text.
         
         ## KEY REMINDERS
         

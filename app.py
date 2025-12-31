@@ -7,7 +7,7 @@ A shopping assistant that helps find Canadian products from the knowledge base.
 import streamlit as st
 from typing import AsyncIterator, AsyncGenerator
 from agno.agent import RunOutput
-from team import get_agent_team
+from team import get_agent_team, tracking_context
 from random import choice
 import uuid
 import asyncio
@@ -192,6 +192,13 @@ def get_placeholder():
 
 async def run_agent(prompt: str):
     """Run the agent with the given prompt"""
+    # Set tracking context for click tracking URLs
+    tracking_context.set_context(
+        user_id=get_user_email(),
+        session_id=st.session_state.session_id,
+        referrer="madeincanada.dev",
+    )
+    
     agent = get_agent_team()
     return agent.arun(
         prompt,
