@@ -3,19 +3,23 @@ Made in Canada - Backend API
 
 FastAPI backend for:
 - Click tracking with UTM parameters
-- Future: Agent API, webhooks, etc.
+- Agent chat API with streaming
+- Product search API
 
 Run with: uvicorn backend:app --port 8000 --reload
 """
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 from datetime import datetime
-from typing import Optional
+from typing import Optional, AsyncGenerator
+from pydantic import BaseModel
 import logging
 import os
+import asyncio
+import json
 
 from decouple import config
 
@@ -363,6 +367,384 @@ async def get_click_stats(
 async def health():
     """Health check endpoint"""
     return {"status": "ok", "service": "madeinca-backend"}
+
+
+# ============================================================================
+# Agent Chat API
+# ============================================================================
+
+class ChatRequest(BaseModel):
+    """Request body for chat endpoint"""
+    message: str
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    referrer: Optional[str] = "madeincanada.dev"
+
+
+class ChatResponse(BaseModel):
+    """Response body for non-streaming chat"""
+    content: str
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+# Lazy-loaded agent (cached)
+_agent_instance = None
+
+
+def get_agent():
+    """Get or create the agent instance (cached)"""
+    global _agent_instance
+    if _agent_instance is None:
+        # Import here to avoid circular imports and speed up startup
+        from team import get_agent_team_no_cache
+        _agent_instance = get_agent_team_no_cache()
+        log.info("🤖 Agent initialized")
+    return _agent_instance
+
+
+async def stream_agent_response(
+    message: str,
+    user_id: Optional[str],
+    session_id: Optional[str],
+    referrer: Optional[str],
+) -> AsyncGenerator[str, None]:
+    """Stream agent response as Server-Sent Events"""
+    # Set tracking context
+    from team import tracking_context
+    tracking_context.set_context(
+        user_id=user_id,
+        session_id=session_id,
+        referrer=referrer or "madeincanada.dev",
+    )
+    
+    agent = get_agent()
+    
+    try:
+        # When stream=True, arun() returns an async generator directly (not a coroutine)
+        stream = agent.arun(
+            message,
+            stream=True,
+            stream_events=True,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        
+        async for chunk in stream:
+            if hasattr(chunk, "event"):
+                # Send different event types
+                if chunk.event == "RunContent" and chunk.content:
+                    yield f"data: {json.dumps({'type': 'content', 'content': chunk.content})}\n\n"
+                elif chunk.event == "ToolCallStarted":
+                    tool_name = chunk.tool.tool_name if hasattr(chunk, 'tool') else "unknown"
+                    yield f"data: {json.dumps({'type': 'tool_start', 'tool': tool_name})}\n\n"
+                elif chunk.event == "ToolCallCompleted":
+                    yield f"data: {json.dumps({'type': 'tool_complete'})}\n\n"
+        
+        # Signal end of stream
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        
+    except Exception as e:
+        log.error(f"❌ Agent error: {e}")
+        yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+
+@app.post("/api/chat")
+async def chat(request: ChatRequest):
+    """
+    Chat with the agent (non-streaming).
+    
+    For streaming, use /api/chat/stream instead.
+    """
+    from team import tracking_context
+    tracking_context.set_context(
+        user_id=request.user_id,
+        session_id=request.session_id,
+        referrer=request.referrer or "madeincanada.dev",
+    )
+    
+    agent = get_agent()
+    
+    try:
+        response = await agent.arun(
+            request.message,
+            user_id=request.user_id,
+            session_id=request.session_id,
+        )
+        return ChatResponse(
+            content=response.content,
+            user_id=request.user_id,
+            session_id=request.session_id,
+        )
+    except Exception as e:
+        log.error(f"❌ Agent error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """
+    Chat with the agent with streaming response (Server-Sent Events).
+    
+    Response format (SSE):
+        data: {"type": "tool_start", "tool": "search_products_sync"}
+        data: {"type": "tool_complete"}
+        data: {"type": "content", "content": "Here are some..."}
+        data: {"type": "content", "content": " Canadian products"}
+        data: {"type": "done"}
+    
+    Usage with JavaScript:
+        const eventSource = new EventSource('/api/chat/stream');
+        eventSource.onmessage = (e) => {
+            const data = JSON.parse(e.data);
+            if (data.type === 'content') console.log(data.content);
+        };
+    """
+    return StreamingResponse(
+        stream_agent_response(
+            message=request.message,
+            user_id=request.user_id,
+            session_id=request.session_id,
+            referrer=request.referrer,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
+
+
+# ============================================================================
+# Product Search API (direct database search, no agent)
+# ============================================================================
+
+class SearchRequest(BaseModel):
+    """Request body for search endpoint"""
+    query: str
+    limit: int = 25
+    made_in_canada_only: bool = False
+
+
+class ProductResult(BaseModel):
+    """A single product result"""
+    name: str
+    brand: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[str] = None
+    currency: Optional[str] = None
+    url: str
+    source_site: Optional[str] = None
+    made_in_canada: Optional[bool] = None
+    made_in_canada_reason: Optional[str] = None
+    average_rating: Optional[float] = None
+    num_reviews: Optional[int] = None
+    images: Optional[list] = None
+
+
+class SearchResponse(BaseModel):
+    """Response body for search endpoint"""
+    query: str
+    total_results: int
+    results: list[ProductResult]
+
+
+@app.post("/api/search", response_model=SearchResponse)
+async def search_products_api(request: SearchRequest):
+    """
+    Search products directly (without the agent).
+    
+    This is useful for:
+    - Building custom UIs
+    - Mobile apps
+    - Third-party integrations
+    
+    Returns raw search results without agent formatting.
+    """
+    try:
+        from team import search_products
+        
+        # Call the search function
+        result_str = await search_products(request.query, limit=request.limit)
+        
+        # Parse results (search_products returns a formatted string for the agent)
+        # For the API, we should return structured data
+        # Let's call the underlying function directly
+        from team import (
+            generate_embedding,
+            parse_query,
+            dedupe_results,
+            rerank_results,
+            DB_CONFIG,
+            INITIAL_SEARCH_LIMIT,
+            RERANK_TOP_N,
+            MADE_IN_CANADA_BOOST,
+        )
+        
+        parsed = parse_query(request.query)
+        embedding = await generate_embedding(parsed.intent)
+        embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+        
+        conn_string = (
+            f"host={DB_CONFIG['host']} "
+            f"dbname={DB_CONFIG['dbname']} "
+            f"user={DB_CONFIG['user']} "
+            f"password={DB_CONFIG['password']}"
+        )
+        
+        mic_filter = "AND p.made_in_canada = true" if request.made_in_canada_only else ""
+        
+        async with await psycopg.AsyncConnection.connect(conn_string) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(f"""
+                    --sql
+                    WITH q AS (
+                        SELECT 
+                            %s::vector AS q_embedding,
+                            plainto_tsquery('english', %s) AS q_ts
+                    ),
+                    
+                    vec AS (
+                        SELECT
+                            p.name,
+                            p.brand,
+                            p.description,
+                            p.price,
+                            p.currency,
+                            p.url,
+                            p.source_site,
+                            1 - (p.embedding <=> q.q_embedding) AS vector_similarity,
+                            NULL::float AS text_rank,
+                            p.num_reviews,
+                            p.average_rating,
+                            p.images,
+                            p.made_in_canada,
+                            p.made_in_canada_reason
+                        FROM products p
+                        CROSS JOIN q
+                        WHERE p.embedding IS NOT NULL {mic_filter}
+                        ORDER BY p.embedding <=> q.q_embedding
+                        LIMIT %s
+                    ),
+                    
+                    txt AS (
+                        SELECT
+                            p.name,
+                            p.brand,
+                            p.description,
+                            p.price,
+                            p.currency,
+                            p.url,
+                            p.source_site,
+                            NULL::float AS vector_similarity,
+                            ts_rank_cd(
+                                to_tsvector('english',
+                                    coalesce(p.name,'') || ' ' ||
+                                    coalesce(p.brand,'') || ' ' ||
+                                    coalesce(p.description,'')
+                                ),
+                                q.q_ts
+                            )::float AS text_rank,
+                            p.num_reviews,
+                            p.average_rating,
+                            p.images,
+                            p.made_in_canada,
+                            p.made_in_canada_reason
+                        FROM products p
+                        CROSS JOIN q
+                        WHERE q.q_ts @@ to_tsvector('english',
+                            coalesce(p.name,'') || ' ' ||
+                            coalesce(p.brand,'') || ' ' ||
+                            coalesce(p.description,'')
+                        ) {mic_filter}
+                        ORDER BY text_rank DESC
+                        LIMIT %s
+                    ),
+                    
+                    combined AS (
+                        SELECT * FROM vec
+                        UNION ALL
+                        SELECT * FROM txt
+                    ),
+                    
+                    deduped AS (
+                        SELECT
+                            url,
+                            max(name) AS name,
+                            max(brand) AS brand,
+                            max(description) AS description,
+                            max(price) AS price,
+                            max(currency) AS currency,
+                            max(source_site) AS source_site,
+                            max(coalesce(vector_similarity, 0.0)) AS vector_similarity,
+                            max(coalesce(text_rank, 0.0)) AS text_rank,
+                            max(num_reviews) AS num_reviews,
+                            max(average_rating) AS average_rating,
+                            max(images::text)::jsonb AS images,
+                            bool_or(made_in_canada) AS made_in_canada,
+                            max(made_in_canada_reason) AS made_in_canada_reason
+                        FROM combined
+                        GROUP BY url
+                    )
+                    
+                    SELECT
+                        name,
+                        brand,
+                        description,
+                        price,
+                        currency,
+                        url,
+                        source_site,
+                        made_in_canada,
+                        made_in_canada_reason,
+                        average_rating,
+                        num_reviews,
+                        images
+                    FROM deduped
+                    ORDER BY 
+                        (0.5 * vector_similarity) + (0.5 * text_rank) + 
+                        CASE WHEN made_in_canada = true THEN %s ELSE 0.0 END DESC
+                    LIMIT %s
+                    --end-sql
+                """, (
+                    embedding_str,
+                    parsed.intent,
+                    INITIAL_SEARCH_LIMIT,
+                    INITIAL_SEARCH_LIMIT,
+                    MADE_IN_CANADA_BOOST,
+                    request.limit,
+                ))
+                
+                rows = await cur.fetchall()
+        
+        # Convert to response
+        products = []
+        for row in rows:
+            products.append(ProductResult(
+                name=row[0] or "",
+                brand=row[1],
+                description=row[2],
+                price=row[3],
+                currency=row[4],
+                url=row[5] or "",
+                source_site=row[6],
+                made_in_canada=row[7],
+                made_in_canada_reason=row[8],
+                average_rating=row[9],
+                num_reviews=row[10],
+                images=row[11] if row[11] else None,
+            ))
+        
+        return SearchResponse(
+            query=request.query,
+            total_results=len(products),
+            results=products,
+        )
+        
+    except Exception as e:
+        log.error(f"❌ Search error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # Helper function to generate tracked URLs (can be imported by agent)

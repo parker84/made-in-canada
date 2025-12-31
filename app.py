@@ -2,26 +2,31 @@
 Made in Canada - Streamlit Frontend
 
 A shopping assistant that helps find Canadian products from the knowledge base.
+
+This UI calls the backend API for agent interactions, allowing the backend 
+to scale independently.
 """
 
 import streamlit as st
-from typing import AsyncIterator, AsyncGenerator
-from agno.agent import RunOutput
-from team import get_agent_team, tracking_context
+from typing import AsyncGenerator
 from random import choice
 import uuid
 import asyncio
 import logging
 import os
 import time
+import json
 
+import httpx
 import coloredlogs
+from decouple import config
 
 logger = logging.getLogger(__name__)
 coloredlogs.install(level=os.getenv("LOG_LEVEL", "INFO"), logger=logger)
 
 # Configuration
 SHOW_PROGRESS_STATUS = True
+BACKEND_URL = config("BACKEND_URL", default="http://localhost:8000")
 
 # User-friendly tool names
 TOOL_DISPLAY_NAMES = {
@@ -88,50 +93,119 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 
-async def parse_stream(stream: AsyncIterator[RunOutput]) -> AsyncGenerator[tuple[str, str], None]:
-    """Parse the agent stream and yield content/status updates"""
+async def stream_from_backend(
+    prompt: str,
+    user_id: str,
+    session_id: str,
+) -> AsyncGenerator[tuple[str, str], None]:
+    """
+    Stream response from the backend API.
+    
+    Yields tuples of (event_type, content):
+    - ("tool_start", tool_name)
+    - ("tool_complete", "")
+    - ("content", text_chunk)
+    - ("done", "")
+    - ("error", error_message)
+    """
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            async with client.stream(
+                "POST",
+                f"{BACKEND_URL}/api/chat/stream",
+                json={
+                    "message": prompt,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "referrer": "madeincanada.dev",
+                },
+            ) as response:
+                if response.status_code != 200:
+                    logger.error(f"Backend returned {response.status_code}")
+                    logger.error(f"Response: {response.text}")
+                    logger.debug(f"Backend URL: {BACKEND_URL}")
+                    logger.debug(f"Prompt: {prompt}")
+                    logger.debug(f"User ID: {user_id}")
+                    logger.debug(f"Session ID: {session_id}")
+                    yield ("error", f"Backend returned {response.status_code}")
+                    return
+                
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        try:
+                            data = json.loads(line[6:])  # Remove "data: " prefix
+                            event_type = data.get("type", "unknown")
+                            
+                            if event_type == "content":
+                                yield ("content", data.get("content", ""))
+                            elif event_type == "tool_start":
+                                yield ("tool_start", data.get("tool", ""))
+                            elif event_type == "tool_complete":
+                                yield ("tool_complete", "")
+                            elif event_type == "done":
+                                yield ("done", "")
+                            elif event_type == "error":
+                                yield ("error", data.get("error", "Unknown error"))
+                        except json.JSONDecodeError:
+                                pass  # Skip malformed lines
+        except httpx.ConnectError:
+            yield ("error", f"Cannot connect to backend at {BACKEND_URL}. Is it running?")
+        except Exception as e:
+            yield ("error", str(e))
+
+
+async def parse_backend_stream(
+    prompt: str,
+    user_id: str,
+    session_id: str,
+) -> AsyncGenerator[tuple[str, str], None]:
+    """Parse the backend stream and yield content/status updates for the UI"""
     last_event = "start"
     tool_start_time = None
     current_tool = None
     planning_start_time = time.time()
     
-    async for chunk in stream:
-        logger.debug(f"{chunk.event if hasattr(chunk, 'event') else 'unknown'}")
-        if hasattr(chunk, "event"):
-            if chunk.event == 'RunContent' and chunk.content:
-                if last_event != "content":
-                    if planning_start_time:
-                        elapsed = time.time() - planning_start_time
-                        yield ("status_complete", f"✅ ({int(round(elapsed))}s)")
-                        planning_start_time = None
-                    yield ("status_start", "💭 Generating response...")
-                    last_event = "content"
-                yield ("content", chunk.content)
-                
-            elif SHOW_PROGRESS_STATUS and chunk.event == "ToolCallStarted":
-                if last_event in ["analyzing", "start"]:
-                    elapsed = time.time() - (planning_start_time or time.time())
+    async for event_type, content in stream_from_backend(prompt, user_id, session_id):
+        if event_type == "content":
+            if last_event != "content":
+                if planning_start_time:
+                    elapsed = time.time() - planning_start_time
                     yield ("status_complete", f"✅ ({int(round(elapsed))}s)")
                     planning_start_time = None
-                
-                current_tool = chunk.tool.tool_name
-                tool_display = TOOL_DISPLAY_NAMES.get(
-                    current_tool, 
-                    current_tool.replace("_", " ").title()
-                )
-                
-                tool_start_time = time.time()
-                last_event = "tool_call"
-                yield ("status_start", f"🔍 {tool_display}...")
-                
-            elif chunk.event == "ToolCallCompleted":
-                if tool_start_time and current_tool:
-                    elapsed = time.time() - tool_start_time
-                    logger.info(f"✅ {current_tool} completed in {elapsed:.2f}s")
-                    yield ("status_complete", f"✅ ({int(round(elapsed))}s)")
-                    planning_start_time = time.time()
-                    yield ("status_start", "🧠 Analyzing results...")
-                    last_event = "analyzing"
+                yield ("status_start", "💭 Generating response...")
+                last_event = "content"
+            yield ("content", content)
+            
+        elif event_type == "tool_start" and SHOW_PROGRESS_STATUS:
+            if last_event in ["analyzing", "start"]:
+                elapsed = time.time() - (planning_start_time or time.time())
+                yield ("status_complete", f"✅ ({int(round(elapsed))}s)")
+                planning_start_time = None
+            
+            current_tool = content
+            tool_display = TOOL_DISPLAY_NAMES.get(
+                current_tool, 
+                current_tool.replace("_", " ").title()
+            )
+            
+            tool_start_time = time.time()
+            last_event = "tool_call"
+            yield ("status_start", f"🔍 {tool_display}...")
+            
+        elif event_type == "tool_complete":
+            if tool_start_time and current_tool:
+                elapsed = time.time() - tool_start_time
+                logger.info(f"✅ {current_tool} completed in {elapsed:.2f}s")
+                yield ("status_complete", f"✅ ({int(round(elapsed))}s)")
+                planning_start_time = time.time()
+                yield ("status_start", "🧠 Analyzing results...")
+                last_event = "analyzing"
+        
+        elif event_type == "error":
+            yield ("error", content)
+            
+        elif event_type == "done":
+            pass  # Stream complete
 
 
 # Sidebar (always visible)
@@ -190,25 +264,6 @@ def get_placeholder():
     ])
 
 
-async def run_agent(prompt: str):
-    """Run the agent with the given prompt"""
-    # Set tracking context for click tracking URLs
-    tracking_context.set_context(
-        user_id=get_user_email(),
-        session_id=st.session_state.session_id,
-        referrer="madeincanada.dev",
-    )
-    
-    agent = get_agent_team()
-    return agent.arun(
-        prompt,
-        stream=True,
-        stream_events=True,
-        user_id=get_user_email(),
-        session_id=st.session_state.session_id,
-    )
-
-
 # Chat input
 if prompt := st.chat_input(placeholder=get_placeholder()):
     # Add user message
@@ -225,14 +280,17 @@ if prompt := st.chat_input(placeholder=get_placeholder()):
             
             async def process_stream():
                 response_parts = []
-                stream = await run_agent(prompt)
                 
                 status_container = st.empty()
                 response_placeholder = st.empty()
                 status_lines = ["🧠 Thinking..."]
                 status_container.caption("\n\n".join(status_lines))
                 
-                async for content_type, content in parse_stream(stream):
+                async for content_type, content in parse_backend_stream(
+                    prompt,
+                    get_user_email(),
+                    st.session_state.session_id,
+                ):
                     if content_type == "status_start":
                         status_lines.append(content)
                         status_container.caption("\n\n".join(status_lines))
@@ -246,6 +304,9 @@ if prompt := st.chat_input(placeholder=get_placeholder()):
                             status_lines = []
                         response_parts.append(content)
                         response_placeholder.markdown("".join(response_parts))
+                    elif content_type == "error":
+                        response_placeholder.error(f"❌ {content}")
+                        return content  # Return error as response
                 
                 if status_lines:
                     status_container.empty()
@@ -257,4 +318,3 @@ if prompt := st.chat_input(placeholder=get_placeholder()):
             logger.info(f"✨ Total response time: {total_time:.2f}s")
         
         st.session_state.messages.append({"role": "assistant", "content": full_response})
-

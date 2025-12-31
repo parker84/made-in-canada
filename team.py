@@ -1107,12 +1107,11 @@ def get_llm_model():
         raise ValueError(f"Unsupported LLM provider: {AGENT_LLM_PROVIDER}")
 
 
-@st.cache_resource
-def get_agent_team():
-    """Get the product finder agent"""
+def _create_agent():
+    """Create a new agent instance (internal helper)"""
     logger.info(f"🤖 Initializing agent with {AGENT_LLM_PROVIDER}/{AGENT_MODEL_ID}")
     
-    product_finder_agent = Agent(
+    return Agent(
         name="Made in Canada Product Finder",
         role="Find and recommend Canadian products",
         model=get_llm_model(),
@@ -1131,7 +1130,21 @@ def get_agent_team():
         num_history_runs=NUM_HISTORY_RUNS,
     )
 
-    return product_finder_agent
+
+@st.cache_resource
+def get_agent_team():
+    """Get the product finder agent (Streamlit cached version)"""
+    return _create_agent()
+
+
+def get_agent_team_no_cache():
+    """
+    Get the product finder agent (no caching - for backend API use).
+    
+    Use this when running outside of Streamlit (e.g., FastAPI backend).
+    The backend should cache the agent instance itself.
+    """
+    return _create_agent()
 
 
 async def main():
