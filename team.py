@@ -265,7 +265,7 @@ EMBEDDING_DIMENSIONS = 1536
 RERANK_MODEL = "rerank-v3.5"
 
 # Funnel: 50 (hybrid) → 25 (rerank) → 10 (prompt selection)
-INITIAL_SEARCH_LIMIT = 50  # Hybrid search candidates
+INITIAL_SEARCH_LIMIT = 100  # Hybrid search candidates
 RERANK_TOP_N = 25  # After re-ranking
 PROMPT_TOP_N = 10  # Final results to show
 
@@ -359,25 +359,26 @@ def extract_core_product_type(name: str) -> str:
     return ""
 
 
-def dedupe_results(results: list) -> list:
+def dedupe_results(results: list, max_per_brand_type: int = 0) -> list:
     """
     Remove duplicate products based on normalized name + brand.
     Keeps the first (highest ranked) occurrence.
     
     Uses multiple strategies:
-    1. Normalized name + brand exact match
-    2. URL-based dedup (same product URL with variants)
-    3. Core product type + brand (e.g., only one "hoodie" from each brand)
+    1. Normalized name + brand exact match (same product, different color/size)
+    2. URL-based dedup (same product URL with size variants)
+    3. Optional: Limit products per brand+type (e.g., max 3 toques per brand)
     
     Args:
         results: List of tuples from database (name at index 0, brand at index 1, url at index 5)
+        max_per_brand_type: Max products per (brand, product_type) combo. 0 = no limit.
     
     Returns:
         Deduplicated list
     """
     seen_names = set()
     seen_urls = set()
-    seen_product_brand = {}  # brand -> set of product types already seen
+    seen_product_brand = {}  # (brand, product_type) -> count
     deduped = []
     
     for row in results:
@@ -389,13 +390,14 @@ def dedupe_results(results: list) -> list:
         norm_name = normalize_product_name(name)
         name_key = f"{norm_name}|{brand.lower()}"
         
-        # Strategy 2: URL-based dedup
+        # Strategy 2: URL-based dedup (remove size variants from URL)
         url_base = re.sub(r'[?#].*$', '', url)  # Remove query params
         url_base = re.sub(r'-?(xs|s|m|l|xl|xxl|xxxl)(?:-|$)', '', url_base, flags=re.IGNORECASE)
         
-        # Strategy 3: Core product type + brand (limit one hoodie per brand, etc.)
+        # Strategy 3: Limit per brand+type (only if max_per_brand_type > 0)
         product_type = extract_core_product_type(name)
         brand_lower = brand.lower()
+        brand_type_key = f"{brand_lower}|{product_type}" if product_type else None
         
         # Check for duplicates
         is_dup = False
@@ -407,12 +409,11 @@ def dedupe_results(results: list) -> list:
         elif url_base in seen_urls:
             is_dup = True
             dup_reason = "same URL base"
-        elif product_type and brand_lower:
-            # Check if we already have this product type from this brand
-            if brand_lower in seen_product_brand:
-                if product_type in seen_product_brand[brand_lower]:
-                    is_dup = True
-                    dup_reason = f"already have {product_type} from {brand}"
+        elif max_per_brand_type > 0 and brand_type_key:
+            count = seen_product_brand.get(brand_type_key, 0)
+            if count >= max_per_brand_type:
+                is_dup = True
+                dup_reason = f"already have {max_per_brand_type} {product_type}(s) from {brand}"
         
         if is_dup:
             logger.debug(f"   🔄 Deduped: {name[:40]}... ({dup_reason})")
@@ -421,10 +422,8 @@ def dedupe_results(results: list) -> list:
         # Add to seen sets
         seen_names.add(name_key)
         seen_urls.add(url_base)
-        if product_type and brand_lower:
-            if brand_lower not in seen_product_brand:
-                seen_product_brand[brand_lower] = set()
-            seen_product_brand[brand_lower].add(product_type)
+        if brand_type_key:
+            seen_product_brand[brand_type_key] = seen_product_brand.get(brand_type_key, 0) + 1
         
         deduped.append(row)
     
