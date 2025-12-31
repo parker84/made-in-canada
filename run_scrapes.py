@@ -1,10 +1,28 @@
 #!/usr/bin/env python3
+"""
+Run product scrapers for Canadian brands.
+
+Usage:
+    # Run base jobs (curated list)
+    uv run python run_scrapes.py --source base
+
+    # Run Shopify stores discovered from madeinca.ca
+    uv run python run_scrapes.py --source madeinca
+
+    # Run both
+    uv run python run_scrapes.py --source all
+
+    # Limit madeinca jobs
+    uv run python run_scrapes.py --source madeinca --limit 10
+"""
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -12,8 +30,18 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlparse
 
 import colorlog
+from decouple import config
+
+# PostgreSQL for madeinca lookups
+psycopg_available = False
+try:
+    import psycopg
+    psycopg_available = True
+except ImportError:
+    pass
 
 # Setup colored logging
 def setup_logger() -> logging.Logger:
@@ -35,6 +63,125 @@ def setup_logger() -> logging.Logger:
     return logger
 
 log = setup_logger()
+
+# Database Configuration
+DB_CONFIG = {
+    "host": config("POSTGRES_HOST", default="localhost"),
+    "dbname": config("POSTGRES_DB", default="madeinca"),
+    "user": config("POSTGRES_USER", default="postgres"),
+    "password": config("POSTGRES_PASSWORD", default=""),
+}
+
+
+def get_base_jobs() -> List["Job"]:
+    """Return the curated list of base jobs (known Canadian brands)"""
+    return [
+        Job("roots", "https://www.roots.com", store_type="roots", url_regex=r"\.html"),
+        Job("province_of_canada", "https://provinceofcanada.com", store_type="shopify"),
+        Job("manmade", "https://manmadebrand.com/", store_type="shopify"),
+        Job("tilley", "https://ca.tilley.com/", store_type="shopify"),
+        Job("tentree", "https://www.tentree.com/", store_type="shopify"),
+        Job("kamik", "https://www.kamik.com/", store_type="shopify"),
+        Job("sheertex", "https://sheertex.com/", store_type="shopify"),
+        Job("baffin", "https://www.baffin.com/", store_type="shopify"),
+        Job("bushbalm", "https://bushbalm.com/", store_type="shopify"),
+        Job("soma", "https://www.somachocolate.com/", store_type="shopify"),
+        Job("stanfields", "https://www.stanfields.com/", store_type="shopify"),
+        Job("balzacs", "https://balzacs.com/", store_type="shopify"),
+        Job("muttonhead", "https://muttonheadstore.com/", store_type="shopify"),
+        Job("naked_and_famous", "https://nakedandfamousdenim.com/", store_type="shopify"),
+        Job("regimenlab", "https://regimenlab.ca/", store_type="shopify"),
+        Job("craigs_cookies", "https://craigscookies.com/", store_type="shopify"),
+        Job("jenny_bird", "https://jenny-bird.ca/", store_type="shopify"),
+        Job("green_beaver", "https://greenbeaver.com/", store_type="shopify"),
+        Job("manitobah", "https://www.manitobah.ca/", store_type="shopify"),
+        Job("moose_knuckles", "https://www.mooseknucklescanada.com/", store_type="shopify"),
+        Job("rheo_thompson", "https://rheothompson.com/", store_type="shopify"),
+        Job("davids_tea", "https://davidstea.com/", store_type="shopify"),
+        Job("rocky_mountain_soap", "https://www.rockymountainsoap.com/", store_type="shopify"),
+        Job("kicking_horse", "https://kickinghorsecoffee.ca/", store_type="shopify"),
+        Job("st_viateur", "https://stviateurbagel.com/", store_type="shopify"),
+    ]
+
+
+async def get_madeinca_shopify_jobs(limit: int = 0, exclude_base: bool = True) -> List["Job"]:
+    """
+    Fetch Shopify stores from madeinca_listings table and create jobs for them.
+    
+    Args:
+        limit: Maximum number of jobs to return (0 = all)
+        exclude_base: If True, exclude stores that are already in base jobs
+    """
+    if not psycopg_available:
+        log.error("❌ psycopg not installed. Run: uv add 'psycopg[binary]'")
+        return []
+    
+    # Get base job URLs to exclude duplicates
+    base_urls = set()
+    if exclude_base:
+        for job in get_base_jobs():
+            parsed = urlparse(job.base)
+            base_urls.add(parsed.netloc.lower().replace("www.", ""))
+    
+    jobs = []
+    
+    try:
+        conn_string = f"host={DB_CONFIG['host']} dbname={DB_CONFIG['dbname']} user={DB_CONFIG['user']} password={DB_CONFIG['password']}"
+        async with await psycopg.AsyncConnection.connect(conn_string) as conn:
+            async with conn.cursor() as cur:
+                # Fetch Shopify stores from madeinca_listings
+                query = """
+                    SELECT name, website, url
+                    FROM madeinca_listings
+                    WHERE is_shopify_store = TRUE
+                      AND website IS NOT NULL
+                      AND website != ''
+                    ORDER BY name
+                """
+                if limit > 0:
+                    query += f" LIMIT {limit}"
+                
+                await cur.execute(query)
+                rows = await cur.fetchall()
+                
+                log.info(f"📊 Found {len(rows)} Shopify stores in madeinca_listings")
+                
+                for name, website, madeinca_url in rows:
+                    # Normalize website URL
+                    website = website.strip()
+                    if not website.startswith("http"):
+                        website = "https://" + website
+                    
+                    # Check if already in base jobs
+                    parsed = urlparse(website)
+                    domain = parsed.netloc.lower().replace("www.", "")
+                    
+                    if domain in base_urls:
+                        log.debug(f"   ⏭️  Skipping {name} ({domain}) - already in base jobs")
+                        continue
+                    
+                    # Create a safe job name from the company name
+                    job_name = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')[:30]
+                    job_name = f"madeinca_{job_name}"
+                    
+                    jobs.append(Job(
+                        name=job_name,
+                        base=website,
+                        store_type="shopify",
+                        use_browser=True,
+                        max_categories=1000,
+                        use_postgres=True,
+                    ))
+                    
+                    log.debug(f"   ✅ Added job: {job_name} → {website}")
+        
+        log.info(f"✅ Created {len(jobs)} madeinca Shopify jobs (excluded {len(rows) - len(jobs)} duplicates)")
+        
+    except Exception as e:
+        log.error(f"❌ Failed to fetch madeinca Shopify stores: {e}")
+    
+    return jobs
+
 
 # Track job states for status updates
 queued_jobs: set[str] = set()  # Jobs waiting for semaphore
@@ -253,12 +400,41 @@ async def status_reporter(stop: asyncio.Event, total_jobs: int, max_parallel: in
 
 
 async def main():
-    # ✅ Keep this low if you use --use-browser (Playwright/Chromium is heavy).
-    # Start with 2. If stable, try 3–4.
-    max_parallel = int(os.getenv("SCRAPE_MAX_PARALLEL", "2"))
-
-    # Optional: space out store starts a bit to avoid bursty behavior
-    cooldown_s = float(os.getenv("SCRAPE_COOLDOWN_S", "1.0"))
+    # Parse arguments
+    ap = argparse.ArgumentParser(description="Run product scrapers for Canadian brands")
+    ap.add_argument(
+        "--source", 
+        choices=["base", "madeinca", "all"], 
+        default="all",
+        help="Which jobs to run: base (curated list), madeinca (Shopify from DB), all (both)"
+    )
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Limit number of madeinca jobs (0 = all)"
+    )
+    ap.add_argument(
+        "--max-parallel",
+        type=int,
+        default=int(os.getenv("SCRAPE_MAX_PARALLEL", "2")),
+        help="Max parallel scrapers (default: 2)"
+    )
+    ap.add_argument(
+        "--cooldown",
+        type=float,
+        default=float(os.getenv("SCRAPE_COOLDOWN_S", "1.0")),
+        help="Seconds between job starts (default: 1.0)"
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List jobs without running them"
+    )
+    args = ap.parse_args()
+    
+    max_parallel = args.max_parallel
+    cooldown_s = args.cooldown
 
     if not os.path.isdir("./logs"):
         os.makedirs("./logs", exist_ok=True)
@@ -268,33 +444,25 @@ async def main():
 
     report_path = Path("./logs/scrape_report.jsonl")
 
-    jobs: List[Job] = [
-        Job("roots", "https://www.roots.com", store_type="roots", url_regex=r"\.html"),
-        Job("province_of_canada", "https://provinceofcanada.com", store_type="shopify"),
-        Job("manmade", "https://manmadebrand.com/", store_type="shopify"),
-        Job("tilley", "https://ca.tilley.com/", store_type="shopify"),
-        Job("tentree", "https://www.tentree.com/", store_type="shopify"),
-        Job("kamik", "https://www.kamik.com/", store_type="shopify"),
-        Job("sheertex", "https://sheertex.com/", store_type="shopify"),
-        Job("baffin", "https://www.baffin.com/", store_type="shopify"),
-        Job("bushbalm", "https://bushbalm.com/", store_type="shopify"),
-        Job("soma", "https://www.somachocolate.com/", store_type="shopify"),
-        Job("stanfields", "https://www.stanfields.com/", store_type="shopify"),
-        Job("balzacs", "https://balzacs.com/", store_type="shopify"),
-        Job("muttonhead", "https://muttonheadstore.com/", store_type="shopify"),
-        Job("naked_and_famous", "https://nakedandfamousdenim.com/", store_type="shopify"),
-        Job("regimenlab", "https://regimenlab.ca/", store_type="shopify"),
-        Job("craigs_cookies", "https://craigscookies.com/", store_type="shopify"),
-        Job("jenny_bird", "https://jenny-bird.ca/", store_type="shopify"),
-        Job("green_beaver", "https://greenbeaver.com/", store_type="shopify"),
-        Job("manitobah", "https://www.manitobah.ca/", store_type="shopify"),
-        Job("moose_knuckles", "https://www.mooseknucklescanada.com/", store_type="shopify"),
-        Job("rheo_thompson", "https://rheothompson.com/", store_type="shopify"),
-        Job("davids_tea", "https://davidstea.com/", store_type="shopify"),
-        Job("rocky_mountain_soap", "https://www.rockymountainsoap.com/", store_type="shopify"),
-        Job("kicking_horse", "https://kickinghorsecoffee.ca/", store_type="shopify"),
-        Job("st_viateur", "https://stviateurbagel.com/", store_type="shopify"),
-    ]
+    # Build job list based on source
+    jobs: List[Job] = []
+    
+    if args.source in ["base", "all"]:
+        base_jobs = get_base_jobs()
+        jobs.extend(base_jobs)
+        log.info(f"📦 Added {len(base_jobs)} base jobs")
+    
+    if args.source in ["madeinca", "all"]:
+        madeinca_jobs = await get_madeinca_shopify_jobs(
+            limit=args.limit,
+            exclude_base=(args.source == "all")  # Only exclude if running both
+        )
+        jobs.extend(madeinca_jobs)
+        log.info(f"📦 Added {len(madeinca_jobs)} madeinca Shopify jobs")
+    
+    if not jobs:
+        log.error("❌ No jobs to run!")
+        sys.exit(1)
 
     total_jobs = len(jobs)
     start_time = time.time()
@@ -302,6 +470,7 @@ async def main():
     log.info("=" * 60)
     log.info(f"🍁 Made in Canada Scraper - Starting {total_jobs} jobs")
     log.info(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"📂 Source: {args.source}")
     log.info(f"⚙️  Max parallel: {max_parallel}, Cooldown: {cooldown_s}s")
     log.info(f"📁 Logs: {logs_dir.resolve()}")
     log.info("=" * 60)
@@ -309,7 +478,14 @@ async def main():
     # List all jobs
     log.info("📋 Jobs to run:")
     for i, j in enumerate(jobs, 1):
-        log.info(f"   {i:2}. {j.name:<20} → {j.base}")
+        log.info(f"   {i:2}. {j.name:<30} → {j.base}")
+    
+    # Dry run - just list jobs and exit
+    if args.dry_run:
+        log.info("")
+        log.info("🧪 Dry run mode - not executing jobs")
+        log.info(f"   Would run {total_jobs} jobs")
+        return
 
     sem = asyncio.Semaphore(max_parallel)
 
