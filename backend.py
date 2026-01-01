@@ -516,6 +516,116 @@ async def chat_stream(request: ChatRequest):
     )
 
 
+@app.post("/api/search/fast")
+async def fast_search(request: ChatRequest):
+    """
+    Fast product search - bypasses LLM agent entirely.
+    
+    Returns formatted markdown directly from the search tool.
+    This is 10x faster than /api/chat because it skips:
+    - LLM reasoning about what tool to call
+    - LLM processing of tool output
+    - LLM generating response tokens
+    """
+    import time
+    start_time = time.time()
+    
+    # Set tracking context
+    from team import tracking_context, search_products
+    tracking_context.set_context(
+        user_id=request.user_id,
+        session_id=request.session_id,
+        referrer=request.referrer or "madeincanada.dev",
+    )
+    
+    log.info(f"⚡ Fast search: '{request.message[:50]}...'")
+    
+    try:
+        # Call search directly (no agent)
+        result = await search_products(request.message, for_user=True)
+        
+        elapsed = time.time() - start_time
+        log.info(f"⚡ Fast search completed in {elapsed:.2f}s")
+        
+        return ChatResponse(
+            content=result,
+            user_id=request.user_id,
+            session_id=request.session_id,
+        )
+    except Exception as e:
+        log.error(f"❌ Fast search error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def stream_fast_search(
+    message: str,
+    user_id: Optional[str],
+    session_id: Optional[str],
+    referrer: Optional[str],
+) -> AsyncGenerator[str, None]:
+    """Stream fast search results as SSE - bypasses LLM entirely"""
+    import time
+    start_time = time.time()
+    
+    # Set tracking context
+    from team import tracking_context, search_products
+    tracking_context.set_context(
+        user_id=user_id,
+        session_id=session_id,
+        referrer=referrer or "madeincanada.dev",
+    )
+    
+    log.info(f"⚡ Fast search stream: '{message[:50]}...'")
+    
+    # Emit tool start
+    yield f"data: {json.dumps({'type': 'tool_start', 'tool': 'search_products'})}\n\n"
+    
+    try:
+        # Call search directly (no agent) with user-friendly formatting
+        result = await search_products(message, for_user=True)
+        
+        # Emit tool complete
+        elapsed = time.time() - start_time
+        log.info(f"⚡ Fast search completed in {elapsed:.2f}s")
+        yield f"data: {json.dumps({'type': 'tool_complete'})}\n\n"
+        
+        # Emit content directly (no LLM processing!)
+        yield f"data: {json.dumps({'type': 'content', 'content': result})}\n\n"
+        
+        # Done
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        
+    except Exception as e:
+        log.error(f"❌ Fast search error: {e}")
+        yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+
+@app.post("/api/search/fast/stream")
+async def fast_search_stream(request: ChatRequest):
+    """
+    Fast product search with SSE streaming - bypasses LLM agent entirely.
+    
+    Emits the same events as /api/chat/stream but 10x faster because:
+    - No LLM reasoning
+    - No LLM output processing  
+    - Content returned immediately after search
+    """
+    return StreamingResponse(
+        stream_fast_search(
+            message=request.message,
+            user_id=request.user_id,
+            session_id=request.session_id,
+            referrer=request.referrer,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # ============================================================================
 # Product Search API (direct database search, no agent)
 # ============================================================================

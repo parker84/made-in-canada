@@ -112,7 +112,8 @@ async def stream_from_backend(
         try:
             async with client.stream(
                 "POST",
-                f"{BACKEND_URL}/api/chat/stream",
+                # f"{BACKEND_URL}/api/chat/stream",
+                f"{BACKEND_URL}/api/search/fast/stream",  # Fast search - no LLM overhead
                 json={
                     "message": prompt,
                     "user_id": user_id,
