@@ -52,6 +52,34 @@ def track_pageview(page: str, user_id: str = None, session_id: str = None, metad
         pass  # Silently fail - don't block the UI for analytics
 
 
+def submit_feedback(
+    message_id: str,
+    rating: str,
+    user_id: str = None,
+    session_id: str = None,
+    query: str = None,
+    response: str = None,
+    comment: str = None,
+):
+    """Submit feedback for a response (fire-and-forget, non-blocking)"""
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            client.post(
+                f"{BACKEND_URL}/api/feedback",
+                json={
+                    "message_id": message_id,
+                    "rating": rating,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "query": query,
+                    "response": response,
+                    "comment": comment,
+                },
+            )
+    except Exception:
+        pass  # Silently fail - don't block the UI for analytics
+
+
 def get_thinking_message() -> str:
     """Get a random thinking message"""
     messages = [
@@ -109,6 +137,9 @@ if "session_id" not in st.session_state:
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+if "feedback" not in st.session_state:
+    st.session_state.feedback = {}  # message_id -> "up" or "down"
 
 # Track initial pageview (only once per session)
 if "pageview_tracked" not in st.session_state:
@@ -269,10 +300,18 @@ if "login_tracked" not in st.session_state:
     )
 with st.sidebar:
     st.markdown("---")
+    
     if st.button("🔄 Clear Chat"):
         st.session_state.messages = []
+        st.session_state.feedback = {}
         st.rerun()
     st.button("🔐 Log out", on_click=st.logout, type="secondary")
+
+    # Feedback summary
+    if st.session_state.feedback:
+        up_count = sum(1 for v in st.session_state.feedback.values() if v == "up")
+        down_count = sum(1 for v in st.session_state.feedback.values() if v == "down")
+        st.caption(f"📊 Your feedback: 👍 {up_count}  👎 {down_count}")
 
 # Main content
 st.title("🍁 Made in Canada")
@@ -294,11 +333,78 @@ if not st.session_state.messages:
     - "I'm looking for a new hockey stick for my son 🏒"
     """)
 
+def render_feedback_buttons(message_id: str, query: str, response: str):
+    """Render thumbs up/down feedback buttons with popover for comments"""
+    current_feedback = st.session_state.feedback.get(message_id)
+    
+    # If already submitted, just show the selected button
+    if current_feedback:
+        st.caption(f"{'👍' if current_feedback == 'up' else '👎'} Thanks for your feedback!")
+        return
+    
+    col1, col2, col3 = st.columns([1, 1, 10])
+    
+    with col1:
+        with st.popover("👍", help="Helpful response"):
+            st.markdown("**What did you like?** *(optional)*")
+            comment_up = st.text_area(
+                "Comment",
+                key=f"comment_up_{message_id}",
+                placeholder="This was helpful because...",
+                label_visibility="collapsed",
+                height=100,
+            )
+            if st.button("Submit 👍", key=f"submit_up_{message_id}", type="primary"):
+                st.session_state.feedback[message_id] = "up"
+                submit_feedback(
+                    message_id=message_id,
+                    rating="up",
+                    user_id=get_user_email(),
+                    session_id=st.session_state.session_id,
+                    query=query,
+                    response=response[:2000] if response else None,
+                    comment=comment_up if comment_up else None,
+                )
+                st.rerun()
+    
+    with col2:
+        with st.popover("👎", help="Not helpful"):
+            st.markdown("**What could be better?** *(optional)*")
+            comment_down = st.text_area(
+                "Comment", 
+                key=f"comment_down_{message_id}",
+                placeholder="I was looking for... / The results didn't match...",
+                label_visibility="collapsed",
+                height=100,
+            )
+            if st.button("Submit 👎", key=f"submit_down_{message_id}", type="primary"):
+                st.session_state.feedback[message_id] = "down"
+                submit_feedback(
+                    message_id=message_id,
+                    rating="down",
+                    user_id=get_user_email(),
+                    session_id=st.session_state.session_id,
+                    query=query,
+                    response=response[:2000] if response else None,
+                    comment=comment_down if comment_down else None,
+                )
+                st.rerun()
+
+
 # Display chat messages
-for message in st.session_state.messages:
+for i, message in enumerate(st.session_state.messages):
     avatar = "🍁" if message["role"] == "assistant" else "🦫"
     with st.chat_message(message["role"], avatar=avatar):
         st.markdown(message["content"])
+        
+        # Add feedback buttons for assistant messages
+        if message["role"] == "assistant":
+            message_id = message.get("id", f"msg_{i}")
+            # Get the preceding user query for context
+            query = None
+            if i > 0 and st.session_state.messages[i-1]["role"] == "user":
+                query = st.session_state.messages[i-1]["content"]
+            render_feedback_buttons(message_id, query, message["content"])
 
 
 @st.cache_data
@@ -374,4 +480,13 @@ if prompt := st.chat_input(placeholder=get_placeholder()):
             total_time = time.time() - start_time
             logger.info(f"✨ Total response time: {total_time:.2f}s")
         
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
+        # Create unique message ID for feedback tracking
+        message_id = str(uuid.uuid4())
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": full_response,
+            "id": message_id,
+        })
+        
+        # Show feedback buttons immediately after response
+        render_feedback_buttons(message_id, prompt, full_response)

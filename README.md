@@ -184,6 +184,15 @@ curl http://localhost:8000/api/pageviews/stats?days=7
 curl "http://localhost:8000/api/pageviews/stats?days=7&environment=production"
 ```
 
+**View feedback stats:**
+```sh
+# All feedback
+curl http://localhost:8000/api/feedback/stats?days=7
+
+# Production only
+curl "http://localhost:8000/api/feedback/stats?days=7&environment=production"
+```
+
 **Disable tracking:**
 ```sh
 TRACKING_ENABLED=false

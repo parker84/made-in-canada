@@ -159,11 +159,45 @@ async def init_pageview_tracking_table():
         log.error(f"❌ Failed to initialize pageview tracking table: {e}")
 
 
+async def init_feedback_table():
+    """Initialize the feedback tracking table if it doesn't exist"""
+    if not psycopg_available:
+        return
+    
+    try:
+        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS feedback (
+                        id SERIAL PRIMARY KEY,
+                        message_id TEXT NOT NULL,
+                        user_id TEXT,
+                        session_id TEXT,
+                        query TEXT,
+                        response TEXT,
+                        rating TEXT NOT NULL,
+                        comment TEXT,
+                        environment TEXT DEFAULT 'development',
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id)")
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_session ON feedback(session_id)")
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating)")
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_time ON feedback(created_at)")
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_environment ON feedback(environment)")
+                await conn.commit()
+        log.info("✅ Feedback table initialized")
+    except Exception as e:
+        log.error(f"❌ Failed to initialize feedback table: {e}")
+
+
 @app.on_event("startup")
 async def startup():
     """Initialize database on startup"""
     await init_click_tracking_table()
     await init_pageview_tracking_table()
+    await init_feedback_table()
 
 
 def add_utm_params(url: str, extra_params: Optional[dict] = None) -> str:
@@ -570,6 +604,170 @@ async def get_pageview_stats(
                 }
     except Exception as e:
         log.error(f"❌ Failed to get pageview stats: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ============================================================================
+# Feedback Tracking
+# ============================================================================
+
+class FeedbackRequest(BaseModel):
+    """Request body for submitting feedback"""
+    message_id: str
+    rating: str  # "up" or "down"
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    query: Optional[str] = None
+    response: Optional[str] = None
+    comment: Optional[str] = None
+
+
+async def log_feedback(
+    message_id: str,
+    rating: str,
+    user_id: Optional[str],
+    session_id: Optional[str],
+    query: Optional[str],
+    response: Optional[str],
+    comment: Optional[str],
+):
+    """Log feedback to the database"""
+    emoji = "👍" if rating == "up" else "👎"
+    log.info(f"{emoji} Feedback [{ENVIRONMENT}]: {rating} | user={user_id} | message={message_id}")
+    
+    if not psycopg_available:
+        return
+    
+    try:
+        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    INSERT INTO feedback 
+                    (message_id, user_id, session_id, query, response, rating, comment, environment, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    message_id,
+                    user_id,
+                    session_id,
+                    query[:2000] if query else None,  # Truncate long queries
+                    response[:5000] if response else None,  # Truncate long responses
+                    rating,
+                    comment,
+                    ENVIRONMENT,
+                    datetime.now(),
+                ))
+                await conn.commit()
+    except Exception as e:
+        log.error(f"❌ Failed to log feedback: {e}")
+
+
+@app.post("/api/feedback")
+async def submit_feedback(body: FeedbackRequest):
+    """
+    Submit feedback for a chat response.
+    
+    Example:
+        POST /api/feedback
+        {"message_id": "abc123", "rating": "up", "query": "winter jackets", "response": "..."}
+    """
+    if body.rating not in ("up", "down"):
+        return JSONResponse({"error": "rating must be 'up' or 'down'"}, status_code=400)
+    
+    await log_feedback(
+        message_id=body.message_id,
+        rating=body.rating,
+        user_id=body.user_id,
+        session_id=body.session_id,
+        query=body.query,
+        response=body.response,
+        comment=body.comment,
+    )
+    
+    return {"status": "ok"}
+
+
+@app.get("/api/feedback/stats")
+async def get_feedback_stats(
+    days: int = Query(7, description="Number of days to look back"),
+    environment: Optional[str] = Query(None, description="Filter by environment (development/production)"),
+):
+    """Get feedback statistics"""
+    if not psycopg_available:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    
+    try:
+        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+            async with conn.cursor() as cur:
+                # Build WHERE clause dynamically
+                where_clauses = ["created_at > NOW() - INTERVAL '%s days'"]
+                params = [days]
+                
+                if environment:
+                    where_clauses.append("environment = %s")
+                    params.append(environment)
+                
+                where_sql = " AND ".join(where_clauses)
+                
+                # Total feedback counts
+                query = f"""
+                    SELECT 
+                        COUNT(*) as total_feedback,
+                        COUNT(*) FILTER (WHERE rating = 'up') as thumbs_up,
+                        COUNT(*) FILTER (WHERE rating = 'down') as thumbs_down,
+                        COUNT(DISTINCT user_id) as unique_users
+                    FROM feedback 
+                    WHERE {where_sql}
+                """
+                
+                await cur.execute(query, params)
+                row = await cur.fetchone()
+                
+                # Recent negative feedback (for review)
+                negative_query = f"""
+                    SELECT message_id, user_id, query, comment, created_at
+                    FROM feedback
+                    WHERE {where_sql} AND rating = 'down'
+                    ORDER BY created_at DESC
+                    LIMIT 20
+                """
+                await cur.execute(negative_query, params)
+                negative_feedback = await cur.fetchall()
+                
+                # Feedback by environment
+                env_query = f"""
+                    SELECT environment, rating, COUNT(*) as count
+                    FROM feedback
+                    WHERE created_at > NOW() - INTERVAL '%s days'
+                    GROUP BY environment, rating
+                """
+                await cur.execute(env_query, [days])
+                env_breakdown = await cur.fetchall()
+                
+                return {
+                    "period_days": days,
+                    "filter_environment": environment,
+                    "total_feedback": row[0] if row else 0,
+                    "thumbs_up": row[1] if row else 0,
+                    "thumbs_down": row[2] if row else 0,
+                    "unique_users": row[3] if row else 0,
+                    "satisfaction_rate": round(row[1] / row[0] * 100, 1) if row and row[0] > 0 else None,
+                    "feedback_by_environment": [
+                        {"environment": r[0], "rating": r[1], "count": r[2]}
+                        for r in env_breakdown
+                    ],
+                    "recent_negative_feedback": [
+                        {
+                            "message_id": r[0],
+                            "user_id": r[1],
+                            "query": r[2],
+                            "comment": r[3],
+                            "created_at": r[4].isoformat() if r[4] else None,
+                        }
+                        for r in negative_feedback
+                    ],
+                }
+    except Exception as e:
+        log.error(f"❌ Failed to get feedback stats: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
