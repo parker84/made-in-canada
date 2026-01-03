@@ -166,13 +166,22 @@ All product links go through the tracking endpoint with UTM parameters:
 /click?url=https://example.com&source=brand&product_name=Product&referrer=madeincanada.dev
 ```
 
-**View stats:**
+**View click stats:**
 ```sh
 # All clicks
 curl http://localhost:8000/api/clicks/stats?days=7
 
 # Production only
 curl "http://localhost:8000/api/clicks/stats?days=7&environment=production"
+```
+
+**View pageview stats:**
+```sh
+# All pageviews
+curl http://localhost:8000/api/pageviews/stats?days=7
+
+# Production only
+curl "http://localhost:8000/api/pageviews/stats?days=7&environment=production"
 ```
 
 **Disable tracking:**

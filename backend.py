@@ -126,10 +126,44 @@ async def init_click_tracking_table():
         log.error(f"❌ Failed to initialize click tracking table: {e}")
 
 
+async def init_pageview_tracking_table():
+    """Initialize the pageview tracking table if it doesn't exist"""
+    if not psycopg_available:
+        return
+    
+    try:
+        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS pageviews (
+                        id SERIAL PRIMARY KEY,
+                        page TEXT NOT NULL,
+                        user_id TEXT,
+                        session_id TEXT,
+                        referrer TEXT,
+                        user_agent TEXT,
+                        ip_address TEXT,
+                        environment TEXT DEFAULT 'development',
+                        metadata JSONB,
+                        viewed_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_pageviews_page ON pageviews(page)")
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_pageviews_user ON pageviews(user_id)")
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_pageviews_time ON pageviews(viewed_at)")
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_pageviews_session ON pageviews(session_id)")
+                await cur.execute("CREATE INDEX IF NOT EXISTS idx_pageviews_environment ON pageviews(environment)")
+                await conn.commit()
+        log.info("✅ Pageview tracking table initialized")
+    except Exception as e:
+        log.error(f"❌ Failed to initialize pageview tracking table: {e}")
+
+
 @app.on_event("startup")
 async def startup():
     """Initialize database on startup"""
     await init_click_tracking_table()
+    await init_pageview_tracking_table()
 
 
 def add_utm_params(url: str, extra_params: Optional[dict] = None) -> str:
@@ -360,6 +394,182 @@ async def get_click_stats(
                 }
     except Exception as e:
         log.error(f"❌ Failed to get click stats: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ============================================================================
+# Pageview Tracking
+# ============================================================================
+
+class PageviewRequest(BaseModel):
+    """Request body for logging a pageview"""
+    page: str
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    referrer: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
+async def log_pageview(
+    page: str,
+    user_id: Optional[str],
+    session_id: Optional[str],
+    referrer: Optional[str],
+    user_agent: Optional[str],
+    ip_address: Optional[str],
+    metadata: Optional[dict],
+):
+    """Log a pageview to the database"""
+    log.info(f"👁️ Pageview [{ENVIRONMENT}]: {page} | user={user_id} | session={session_id}")
+    
+    if not psycopg_available:
+        return
+    
+    try:
+        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    INSERT INTO pageviews 
+                    (page, user_id, session_id, referrer, user_agent, ip_address, environment, metadata, viewed_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    page,
+                    user_id,
+                    session_id,
+                    referrer,
+                    user_agent,
+                    ip_address,
+                    ENVIRONMENT,
+                    json.dumps(metadata) if metadata else None,
+                    datetime.now(),
+                ))
+                await conn.commit()
+    except Exception as e:
+        log.error(f"❌ Failed to log pageview: {e}")
+
+
+@app.post("/api/pageview")
+async def track_pageview(request: Request, body: PageviewRequest):
+    """
+    Track a pageview event.
+    
+    Example:
+        POST /api/pageview
+        {"page": "/", "user_id": "abc123", "session_id": "sess456"}
+    """
+    user_agent = request.headers.get("user-agent")
+    ip_address = request.client.host if request.client else None
+    
+    await log_pageview(
+        page=body.page,
+        user_id=body.user_id,
+        session_id=body.session_id,
+        referrer=body.referrer,
+        user_agent=user_agent,
+        ip_address=ip_address,
+        metadata=body.metadata,
+    )
+    
+    return {"status": "ok"}
+
+
+@app.get("/api/pageviews/stats")
+async def get_pageview_stats(
+    days: int = Query(7, description="Number of days to look back"),
+    page: Optional[str] = Query(None, description="Filter by page"),
+    environment: Optional[str] = Query(None, description="Filter by environment (development/production)"),
+):
+    """Get pageview statistics"""
+    if not psycopg_available:
+        return JSONResponse({"error": "Database not available"}, status_code=503)
+    
+    try:
+        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+            async with conn.cursor() as cur:
+                # Build WHERE clause dynamically
+                where_clauses = ["viewed_at > NOW() - INTERVAL '%s days'"]
+                params = [days]
+                
+                if page:
+                    where_clauses.append("page = %s")
+                    params.append(page)
+                
+                if environment:
+                    where_clauses.append("environment = %s")
+                    params.append(environment)
+                
+                where_sql = " AND ".join(where_clauses)
+                
+                # Total pageviews
+                query = f"""
+                    SELECT 
+                        COUNT(*) as total_pageviews,
+                        COUNT(DISTINCT user_id) as unique_users,
+                        COUNT(DISTINCT session_id) as unique_sessions
+                    FROM pageviews 
+                    WHERE {where_sql}
+                """
+                
+                await cur.execute(query, params)
+                row = await cur.fetchone()
+                
+                # Top pages (with same filters)
+                top_query = f"""
+                    SELECT page, environment, COUNT(*) as views
+                    FROM pageviews
+                    WHERE {where_sql}
+                    GROUP BY page, environment
+                    ORDER BY views DESC
+                    LIMIT 20
+                """
+                await cur.execute(top_query, params)
+                top_pages = await cur.fetchall()
+                
+                # Pageviews by environment breakdown
+                env_query = f"""
+                    SELECT environment, COUNT(*) as views
+                    FROM pageviews
+                    WHERE viewed_at > NOW() - INTERVAL '%s days'
+                    GROUP BY environment
+                """
+                await cur.execute(env_query, [days])
+                env_breakdown = await cur.fetchall()
+                
+                # Pageviews by hour (for charts)
+                hourly_query = f"""
+                    SELECT 
+                        date_trunc('hour', viewed_at) as hour,
+                        COUNT(*) as views
+                    FROM pageviews
+                    WHERE {where_sql}
+                    GROUP BY hour
+                    ORDER BY hour DESC
+                    LIMIT 168  -- 7 days of hours
+                """
+                await cur.execute(hourly_query, params)
+                hourly_data = await cur.fetchall()
+                
+                return {
+                    "period_days": days,
+                    "filter_environment": environment,
+                    "filter_page": page,
+                    "total_pageviews": row[0] if row else 0,
+                    "unique_users": row[1] if row else 0,
+                    "unique_sessions": row[2] if row else 0,
+                    "pageviews_by_environment": {
+                        r[0]: r[1] for r in env_breakdown
+                    },
+                    "top_pages": [
+                        {"page": r[0], "environment": r[1], "views": r[2]}
+                        for r in top_pages
+                    ],
+                    "hourly_data": [
+                        {"hour": r[0].isoformat() if r[0] else None, "views": r[1]}
+                        for r in hourly_data
+                    ],
+                }
+    except Exception as e:
+        log.error(f"❌ Failed to get pageview stats: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 

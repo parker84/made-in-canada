@@ -34,6 +34,24 @@ TOOL_DISPLAY_NAMES = {
 }
 
 
+def track_pageview(page: str, user_id: str = None, session_id: str = None, metadata: dict = None):
+    """Track a pageview event (fire-and-forget, non-blocking)"""
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            client.post(
+                f"{BACKEND_URL}/api/pageview",
+                json={
+                    "page": page,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "referrer": "madeincanada.dev",
+                    "metadata": metadata,
+                },
+            )
+    except Exception:
+        pass  # Silently fail - don't block the UI for analytics
+
+
 def get_thinking_message() -> str:
     """Get a random thinking message"""
     messages = [
@@ -91,6 +109,18 @@ if "session_id" not in st.session_state:
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+# Track initial pageview (only once per session)
+if "pageview_tracked" not in st.session_state:
+    st.session_state.pageview_tracked = True
+    # Track async to not block
+    user_email = get_user_email() if is_logged_in() else None
+    track_pageview(
+        page="/",
+        user_id=user_email,
+        session_id=st.session_state.session_id,
+        metadata={"type": "app_load"},
+    )
 
 
 async def stream_from_backend(
@@ -216,9 +246,27 @@ with st.sidebar:
 
 # Check login status
 if not is_logged_in():
+    # Track login page view
+    if "login_pageview_tracked" not in st.session_state:
+        st.session_state.login_pageview_tracked = True
+        track_pageview(
+            page="/login",
+            user_id=None,
+            session_id=st.session_state.session_id,
+            metadata={"type": "login_screen"},
+        )
     login_screen()
 
 # User is logged in - show main app
+# Track successful login (once per session)
+if "login_tracked" not in st.session_state:
+    st.session_state.login_tracked = True
+    track_pageview(
+        page="/",
+        user_id=get_user_email(),
+        session_id=st.session_state.session_id,
+        metadata={"type": "login_success"},
+    )
 with st.sidebar:
     st.markdown("---")
     if st.button("🔄 Clear Chat"):
@@ -269,6 +317,14 @@ def get_placeholder():
 if prompt := st.chat_input(placeholder=get_placeholder()):
     # Add user message
     st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    # Track search query as pageview
+    track_pageview(
+        page="/search",
+        user_id=get_user_email(),
+        session_id=st.session_state.session_id,
+        metadata={"type": "search", "query": prompt},
+    )
     
     with st.chat_message("user", avatar="🦫"):
         st.markdown(prompt)
