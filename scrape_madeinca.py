@@ -1354,7 +1354,8 @@ async def parse_listing_page(client: httpx.AsyncClient, url: str, category: str,
 
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--use-postgres", action="store_true", help="Save to PostgreSQL")
+    ap.add_argument("--use-postgres", action="store_true", default=True, help="Save to PostgreSQL (default: True)")
+    ap.add_argument("--no-postgres", action="store_true", help="Save to JSON instead of PostgreSQL")
     ap.add_argument("--out", default="./out/madeinca", help="Output directory for JSON")
     ap.add_argument("--limit", type=int, default=0, help="Limit number of listings (0 = all)")
     ap.add_argument("--max-categories", type=int, default=0, help="Limit number of categories to crawl (0 = all)")
@@ -1417,7 +1418,8 @@ async def main():
     log.info(f"✅ Parsed {len(listings)} valid listings in {step2_elapsed:.1f}s")
     
     # Step 3: Save to database or JSON
-    if args.use_postgres:
+    use_postgres = args.use_postgres and not args.no_postgres
+    if use_postgres:
         log.info("💾 [3/3] Saving to PostgreSQL...")
         db = MadeInCADatabaseManager(DB_CONFIG)
         await db.connect()

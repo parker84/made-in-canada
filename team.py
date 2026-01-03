@@ -23,10 +23,123 @@ import cohere
 import re
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
+from urllib.parse import urlencode
 
 # Setup logging
 logger = logging.getLogger(__name__)
 coloredlogs.install(level=os.getenv("LOG_LEVEL", "INFO"), logger=logger)
+
+# Click tracking configuration
+TRACKING_ENABLED = config("TRACKING_ENABLED", default="true").lower() == "true"
+TRACKING_BASE_URL = config("TRACKING_BASE_URL", default="http://localhost:8000")
+
+
+class TrackingContext:
+    """
+    Stores tracking context (user_id, session_id) for click tracking.
+    
+    Set the context from your app before running the agent:
+        from team import tracking_context
+        tracking_context.set_context(user_id="user@example.com", session_id="abc-123")
+    
+    The context is then automatically used when creating tracked URLs.
+    """
+    
+    def __init__(self):
+        self._user_id: Optional[str] = None
+        self._session_id: Optional[str] = None
+        self._referrer: Optional[str] = None
+    
+    def set_context(
+        self,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        referrer: Optional[str] = None,
+    ):
+        """Set the tracking context for the current request/session"""
+        self._user_id = user_id
+        self._session_id = session_id
+        self._referrer = referrer
+        logger.debug(f"📊 Tracking context set: user={user_id}, session={session_id}")
+    
+    def clear_context(self):
+        """Clear the tracking context"""
+        self._user_id = None
+        self._session_id = None
+        self._referrer = None
+    
+    @property
+    def user_id(self) -> Optional[str]:
+        return self._user_id
+    
+    @property
+    def session_id(self) -> Optional[str]:
+        return self._session_id
+    
+    @property
+    def referrer(self) -> Optional[str]:
+        return self._referrer
+    
+    def create_tracked_url(
+        self,
+        url: str,
+        source: Optional[str] = None,
+        source_type: str = "product",
+        product_name: Optional[str] = None,
+        product_id: Optional[str] = None,
+    ) -> str:
+        """
+        Create a tracked URL that goes through the click tracking endpoint.
+        Automatically includes user_id, session_id, and referrer from context.
+        Adds UTM parameters automatically on redirect.
+        
+        If tracking is disabled, returns the original URL.
+        """
+        if not TRACKING_ENABLED:
+            return url
+        
+        params = {"url": url}
+        if source:
+            params["source"] = source
+        if source_type:
+            params["source_type"] = source_type
+        if product_name:
+            params["product_name"] = product_name[:100]  # Limit length for URL
+        if product_id:
+            params["product_id"] = product_id
+        if self._user_id:
+            params["user_id"] = self._user_id
+        if self._session_id:
+            params["session_id"] = self._session_id
+        if self._referrer:
+            params["referrer"] = self._referrer
+        
+        query = urlencode(params)
+        return f"{TRACKING_BASE_URL}/click?{query}"
+
+
+# Global tracking context instance - import and use from your app
+tracking_context = TrackingContext()
+
+
+def create_tracked_url(
+    url: str,
+    source: Optional[str] = None,
+    source_type: str = "product",
+    product_name: Optional[str] = None,
+    product_id: Optional[str] = None,
+) -> str:
+    """
+    Convenience function that uses the global tracking context.
+    Prefer using tracking_context.create_tracked_url() directly.
+    """
+    return tracking_context.create_tracked_url(
+        url=url,
+        source=source,
+        source_type=source_type,
+        product_name=product_name,
+        product_id=product_id,
+    )
 
 
 @dataclass
@@ -151,10 +264,11 @@ EMBEDDING_MODEL = "embed-v4.0"
 EMBEDDING_DIMENSIONS = 1536
 RERANK_MODEL = "rerank-v3.5"
 
-# Funnel: 50 (hybrid) → 25 (rerank) → 10 (prompt selection)
-INITIAL_SEARCH_LIMIT = 50  # Hybrid search candidates
-RERANK_TOP_N = 25  # After re-ranking
-PROMPT_TOP_N = 10  # Final results to show
+# Funnel: SQL_CANDIDATES → dedupe → INITIAL_SEARCH_LIMIT → rerank → PROMPT_TOP_N
+SQL_CANDIDATES = 250  # Raw candidates from SQL (before dedupe)
+INITIAL_SEARCH_LIMIT = 100  # After dedupe, before rerank
+RERANK_TOP_N = 50  # After re-ranking
+PROMPT_TOP_N = 50  # Final results to show
 
 # Lengths
 MAX_DESCRIPTION_LENGTH = 500
@@ -246,25 +360,26 @@ def extract_core_product_type(name: str) -> str:
     return ""
 
 
-def dedupe_results(results: list) -> list:
+def dedupe_results(results: list, max_per_brand_type: int = 0) -> list:
     """
     Remove duplicate products based on normalized name + brand.
     Keeps the first (highest ranked) occurrence.
     
     Uses multiple strategies:
-    1. Normalized name + brand exact match
-    2. URL-based dedup (same product URL with variants)
-    3. Core product type + brand (e.g., only one "hoodie" from each brand)
+    1. Normalized name + brand exact match (same product, different color/size)
+    2. URL-based dedup (same product URL with size variants)
+    3. Optional: Limit products per brand+type (e.g., max 3 toques per brand)
     
     Args:
         results: List of tuples from database (name at index 0, brand at index 1, url at index 5)
+        max_per_brand_type: Max products per (brand, product_type) combo. 0 = no limit.
     
     Returns:
         Deduplicated list
     """
     seen_names = set()
     seen_urls = set()
-    seen_product_brand = {}  # brand -> set of product types already seen
+    seen_product_brand = {}  # (brand, product_type) -> count
     deduped = []
     
     for row in results:
@@ -276,13 +391,14 @@ def dedupe_results(results: list) -> list:
         norm_name = normalize_product_name(name)
         name_key = f"{norm_name}|{brand.lower()}"
         
-        # Strategy 2: URL-based dedup
+        # Strategy 2: URL-based dedup (remove size variants from URL)
         url_base = re.sub(r'[?#].*$', '', url)  # Remove query params
         url_base = re.sub(r'-?(xs|s|m|l|xl|xxl|xxxl)(?:-|$)', '', url_base, flags=re.IGNORECASE)
         
-        # Strategy 3: Core product type + brand (limit one hoodie per brand, etc.)
+        # Strategy 3: Limit per brand+type (only if max_per_brand_type > 0)
         product_type = extract_core_product_type(name)
         brand_lower = brand.lower()
+        brand_type_key = f"{brand_lower}|{product_type}" if product_type else None
         
         # Check for duplicates
         is_dup = False
@@ -294,12 +410,11 @@ def dedupe_results(results: list) -> list:
         elif url_base in seen_urls:
             is_dup = True
             dup_reason = "same URL base"
-        elif product_type and brand_lower:
-            # Check if we already have this product type from this brand
-            if brand_lower in seen_product_brand:
-                if product_type in seen_product_brand[brand_lower]:
-                    is_dup = True
-                    dup_reason = f"already have {product_type} from {brand}"
+        elif max_per_brand_type > 0 and brand_type_key:
+            count = seen_product_brand.get(brand_type_key, 0)
+            if count >= max_per_brand_type:
+                is_dup = True
+                dup_reason = f"already have {max_per_brand_type} {product_type}(s) from {brand}"
         
         if is_dup:
             logger.debug(f"   🔄 Deduped: {name[:40]}... ({dup_reason})")
@@ -308,10 +423,8 @@ def dedupe_results(results: list) -> list:
         # Add to seen sets
         seen_names.add(name_key)
         seen_urls.add(url_base)
-        if product_type and brand_lower:
-            if brand_lower not in seen_product_brand:
-                seen_product_brand[brand_lower] = set()
-            seen_product_brand[brand_lower].add(product_type)
+        if brand_type_key:
+            seen_product_brand[brand_type_key] = seen_product_brand.get(brand_type_key, 0) + 1
         
         deduped.append(row)
     
@@ -494,25 +607,39 @@ async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N, p
         return [(*r, None) for r in results[:top_n]]
 
 
-async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
+async def search_products(query: str, limit: int = RERANK_TOP_N, for_user: bool = False) -> str:
     """
     Hybrid search (vector + lexical/FTS) then rerank.
     
+    Args:
+        query: User's search query
+        limit: Maximum results to return
+        for_user: If True, format output for direct user display. 
+                  If False, format for agent consumption with selection instructions.
+    
     Funnel: INITIAL_SEARCH_LIMIT → RERANK_TOP_N → PROMPT_TOP_N
     """
+    import time
+    total_start = time.time()
+    
     try:
         # Parse query to extract filters and core intent
+        parse_start = time.time()
         parsed = parse_query(query)
-        logger.info(f"📝 Query: '{parsed.intent}' | Filters: {parsed.filters}")
+        logger.info(f"📝 Query: '{parsed.intent}' | Filters: {parsed.filters} | Mode: {'user' if for_user else 'agent'}")
+        logger.info(f"⏱️ Query parsing: {time.time() - parse_start:.2f}s ({(time.time() - parse_start)*1000:.0f}ms)")
         
         # Generate embedding for the intent (cleaner than full query)
+        embed_start = time.time()
         embedding = await generate_embedding(parsed.intent)
         embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+        logger.info(f"⏱️ Embedding: {time.time() - embed_start:.2f}s ({(time.time() - embed_start)*1000:.0f}ms)")
 
         # Tuning knobs
-        VECTOR_CANDIDATES = INITIAL_SEARCH_LIMIT            # e.g. 50-200
-        TEXT_CANDIDATES = INITIAL_SEARCH_LIMIT              # e.g. 50-200
-        HYBRID_CANDIDATES = max(VECTOR_CANDIDATES, TEXT_CANDIDATES)
+        # SQL fetches more candidates than we need, then dedupe reduces them
+        VECTOR_CANDIDATES = SQL_CANDIDATES  # Raw candidates per search type
+        TEXT_CANDIDATES = SQL_CANDIDATES
+        HYBRID_CANDIDATES = SQL_CANDIDATES  # Total before dedupe
         ALPHA = 0.5  # weight for vector similarity (0..1). Higher = more semantic, lower = more keyword
 
         conn_string = (
@@ -551,6 +678,7 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
             logger.info(f"🔍 Applied filters: {parsed.filters}")
 
         results = []
+        db_start = time.time()
         async with await psycopg.AsyncConnection.connect(conn_string) as conn:
             async with conn.cursor() as cur:
                 # Notes:
@@ -632,10 +760,23 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                         SELECT * FROM txt
                     ),
 
+                    -- Clean URLs for deduplication: remove query params and size variants
+                    candidates_with_url_base AS (
+                        SELECT *,
+                            -- Remove query params (?...) and hash (#...)
+                            -- Then remove size variants like -xs, -s, -m, -l, -xl, etc.
+                            regexp_replace(
+                                regexp_replace(url, '[?#].*$', ''),  -- Remove query/hash
+                                '-?(xs|s|m|l|xl|xxl|xxxl)(-|$)', '', 'gi'  -- Remove size variants
+                            ) AS url_base
+                        FROM candidates
+                    ),
+
                     deduped AS (
-                        -- If the same product appears in both sets, keep the best signals.
+                        -- Group by cleaned URL to merge size variants
                         SELECT
-                            url,
+                            url_base,
+                            max(url) AS url,  -- Keep one of the original URLs
                             max(name) AS name,
                             max(brand) AS brand,
                             max(description) AS description,
@@ -650,8 +791,8 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                             max(images::text)::jsonb AS images,
                             bool_or(made_in_canada) AS made_in_canada,
                             max(made_in_canada_reason) AS made_in_canada_reason
-                        FROM candidates
-                        GROUP BY url
+                        FROM candidates_with_url_base
+                        GROUP BY url_base
                     ),
 
                     scored AS (
@@ -698,9 +839,25 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                         source_site,
                         vector_similarity AS similarity,
                         markdown_content,
-                        -- Add Made in Canada boost to hybrid score
-                        (%s * vector_similarity_norm) + ((1 - %s) * text_rank_norm) + 
-                        CASE WHEN made_in_canada = true THEN %s ELSE 0.0 END AS hybrid_score,
+                        -- Hybrid score breakdown:
+                        -- 1. Base relevance (max 0.6): weighted vector + text similarity, scaled to max 0.6
+                        -- 2. Made in Canada boost: +0.2 if made_in_canada = true
+                        -- 3. Rating boost (max 0.2, requires 10+ reviews):
+                        --    4.0 = no boost, 4.5 = +0.1, 5.0 = +0.2, <4.0 = negative
+                        
+                        -- Base relevance: cap at 0.6
+                        0.6 * ((%s * vector_similarity_norm) + ((1 - %s) * text_rank_norm)) +
+                        
+                        -- Made in Canada boost: +0.2
+                        CASE WHEN made_in_canada = true THEN 0.2 ELSE 0.0 END +
+                        
+                        -- Rating boost: (rating - 4.0) * 0.2, only if 10+ reviews
+                        -- 4.0 → 0, 4.5 → 0.1, 5.0 → 0.2, 3.5 → -0.1, 3.0 → -0.2
+                        CASE 
+                            WHEN num_reviews IS NULL OR num_reviews < %s THEN 0.0  -- No boost if too few reviews
+                            ELSE (COALESCE(average_rating, 4.0) - 4.0) * 0.2  -- Scale: each 0.5 star above 4 = +0.1
+                        END
+                        AS hybrid_score,
                         num_reviews,
                         average_rating,
                         images,
@@ -717,14 +874,19 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
                 vec_params = filter_params.copy()
                 txt_params = filter_params.copy()
                 
+                # Scoring params: ALPHA (x2 for weighted blend), MIN_REVIEWS_FOR_TRUST for rating boost
+                scoring_params = [ALPHA, ALPHA, MIN_REVIEWS_FOR_TRUST]
+                
                 all_params = tuple(
                     base_params + vec_params + [VECTOR_CANDIDATES] + 
                     txt_params + [TEXT_CANDIDATES] +
-                    [ALPHA, ALPHA, MADE_IN_CANADA_BOOST, HYBRID_CANDIDATES]
+                    scoring_params + [HYBRID_CANDIDATES]
                 )
                 
                 await cur.execute(sql_query, all_params)
                 results = await cur.fetchall()
+        
+        logger.info(f"⏱️ DB query: {time.time() - db_start:.2f}s ({(time.time() - db_start)*1000:.0f}ms) - {len(results)} results")
 
         if results:
             # hybrid_score is at index 9
@@ -735,20 +897,42 @@ async def search_products(query: str, limit: int = RERANK_TOP_N) -> str:
             return "No products found in the knowledge base. Try a different search query."
 
         # Step 1: Deduplicate results (remove size/color variants)
+        dedupe_start = time.time()
+        pre_dedupe = len(results)
         results = dedupe_results(results)
+        dedupe_time = time.time() - dedupe_start
+        post_dedupe = len(results)
         
-        # Step 2: Rerank down to RERANK_TOP_N
+        # Step 2: Limit to INITIAL_SEARCH_LIMIT (order preserved from SQL hybrid_score)
+        results = results[:INITIAL_SEARCH_LIMIT]
+        post_limit = len(results)
+        
+        # Step 3: Rerank down to RERANK_TOP_N
+        rerank_start = time.time()
         results = await rerank_results(parsed.intent, results, top_n=RERANK_TOP_N, prioritize_made_in_canada=wants_mic)
+        rerank_time = time.time() - rerank_start
+        post_rerank = len(results)
         
-        logger.info(f"📊 Funnel: {INITIAL_SEARCH_LIMIT} hybrid → {len(results)} reranked → prompt will select top {PROMPT_TOP_N}")
+        logger.info(f"📊 Funnel: {pre_dedupe} sql → {post_dedupe} de-duped ({dedupe_time:.2f}s) → {post_limit} limited → {post_rerank} re-ranked ({rerank_time:.2f}s)")
 
         # Format results - tuple now includes rerank_score at the end
         # Columns: name(0), brand(1), description(2), price(3), currency(4), url(5), source_site(6), 
         #          similarity(7), markdown_content(8), hybrid_score(9), num_reviews(10), average_rating(11), 
         #          images(12), made_in_canada(13), made_in_canada_reason(14), rerank_score(15)
         
-        # Build header with query context
-        header = f"""## Search Results for: "{parsed.original}"
+        format_start = time.time()
+        
+        # Limit results for user output
+        display_results = results[:PROMPT_TOP_N] if for_user else results
+        
+        # Build header based on audience
+        if for_user:
+            header = f"""Here are **{len(display_results)} Canadian products** for "{parsed.original}":
+
+---
+"""
+        else:
+            header = f"""## Search Results for: "{parsed.original}"
 
 **Found {len(results)} candidate products** (showing top {min(len(results), RERANK_TOP_N)} by relevance)
 
@@ -764,12 +948,12 @@ Prioritize products that:
 ---
 """
         formatted_results = [header]
-        for i, row in enumerate(results, 1):
-            name = row[0]
-            brand = row[1]
+        for i, row in enumerate(display_results, 1):
+            name = row[0] or "Unknown Product"
+            brand_raw = row[1]
             description = row[2]
             price = row[3]
-            currency = row[4]
+            currency = row[4] or "CAD"
             url = row[5]
             source_site = row[6]
             similarity = row[7]
@@ -782,44 +966,118 @@ Prioritize products that:
             made_in_canada_reason = row[14] if len(row) > 14 else None  # AI justification
             rerank_score = row[-1]  # Last element is rerank_score
             
-            formatted_results.append(f"### {i}. {name or 'Unknown Product'}")
-            if rerank_score is not None:
-                formatted_results.append(f" (Score: `{rerank_score:.0%}`)")
+            # Infer brand from source_site if missing
+            if brand_raw:
+                brand = brand_raw
+            elif source_site:
+                SITE_TO_BRAND = {
+                    "provinceofcanada.com": "Province of Canada",
+                    "muttonheadstore.com": "Muttonhead",
+                    "www.mtnhead.com": "Muttonhead",
+                    "roots.com": "Roots",
+                    "www.roots.com": "Roots",
+                }
+                brand = SITE_TO_BRAND.get(source_site, source_site.replace("www.", "").replace(".com", "").replace(".ca", "").title())
+            else:
+                brand = "Unknown Brand"
+            
+            # Clean product name (remove size/gender variants)
+            clean_name = re.sub(
+                r'\s*[-–]\s*(Unisex|Men\'?s?|Women\'?s?|Kids?|Junior|Jr\.?)?\s*[-–]?\s*'
+                r'(XXS|XS|S|M|L|XL|XXL|XXXL|2XL|3XL|Small|Medium|Large|X-Large|XX-Large|One Size).*$',
+                '', name, flags=re.IGNORECASE
+            )
+            clean_name = re.sub(r'\s*[-–]?\s*(XXS|XS|XXL|XXXL|2XL|3XL)\s*$', '', clean_name, flags=re.IGNORECASE)
+            clean_name = re.sub(r'\s*[-–]\s*(Unisex|Men\'?s?|Women\'?s?)\s*$', '', clean_name, flags=re.IGNORECASE)
+            clean_name = clean_name.strip(' -–')
+            
+            # Made in Canada emoji for title
+            mic_emoji = " 🍁" if made_in_canada else ""
+            
+            if for_user:
+                # User-friendly format with ## headers
+                formatted_results.append(f"\n## {i}. {clean_name}{mic_emoji}\n")
+            else:
+                # Agent format with ### and score
+                formatted_results.append(f"### {i}. {clean_name}{mic_emoji}")
+                if rerank_score is not None:
+                    formatted_results.append(f" (Score: `{rerank_score:.0%}`)")
+                formatted_results.append("\n")
             
             # Add product image (first image from the array)
             if images and isinstance(images, list) and len(images) > 0:
                 first_image = images[0]
-                formatted_results.append(f"\n\n![{name or 'Product Image'}]({first_image})")
+                formatted_results.append(f"\n![{clean_name}]({first_image})\n")
             
-            if brand:
-                formatted_results.append(f"\n\n**Brand:** {brand}")
-            if price:
-                formatted_results.append(f"\n\n**Price:** `{price} {currency or ''}`")
+            # Brand and price
+            if for_user:
+                price_str = f"${price} {currency}" if price else "Price N/A"
+                rating_str = f"⭐ {average_rating:.1f} ({num_reviews} reviews)" if average_rating and num_reviews else ""
+                formatted_results.append(f"\n**{brand}** · {price_str}")
+                if rating_str:
+                    formatted_results.append(f" · {rating_str}")
+                formatted_results.append("\n")
+            else:
+                if brand:
+                    formatted_results.append(f"\n**Brand:** {brand}")
+                if price:
+                    formatted_results.append(f"\n**Price:** `{price} {currency}`")
             
-            # Add Made in Canada status with reason
+            # Add Made in Canada status with 🍁
             if made_in_canada is True:
-                reason_text = f" — {made_in_canada_reason}" if made_in_canada_reason else ""
-                formatted_results.append(f"\n\n**Made in Canada:** Yes{reason_text}")
+                reason_short = (made_in_canada_reason[:100] + "...") if made_in_canada_reason and len(made_in_canada_reason) > 100 else made_in_canada_reason
+                reason_text = f" — {reason_short}" if reason_short else ""
+                formatted_results.append(f"\n\n**Made in Canada:** 🍁 Yes{reason_text}")
             elif made_in_canada is False:
                 reason_text = f" — {made_in_canada_reason}" if made_in_canada_reason else ""
-                formatted_results.append(f"\n\n**Made in Canada:** No{reason_text}")
+                formatted_results.append(f"\n\n**Made in Canada:** ❌ No{reason_text}")
             else:
-                formatted_results.append(f"\n\n**Made in Canada:** Unknown")
+                formatted_results.append(f"\n\n**Made in Canada:** ❓ Unknown")
             
-            # Add reviews section
-            if average_rating is not None or num_reviews is not None:
-                rating_str = f"`{average_rating:.1f}`⭐" if average_rating else "N/A"
-                reviews_str = f"`{num_reviews}` reviews" if num_reviews else "No reviews"
-                formatted_results.append(f"\n\n**Reviews:** {rating_str} ({reviews_str})")
+            # Add reviews section (only for agent, user already has inline)
+            if not for_user:
+                if average_rating is not None or num_reviews is not None:
+                    rating_str = f"`{average_rating:.1f}`⭐" if average_rating else "N/A"
+                    reviews_str = f"`{num_reviews}` reviews" if num_reviews else "No reviews"
+                    formatted_results.append(f"\n\n**Reviews:** {rating_str} ({reviews_str})")
+            
+            # Description
             if description:
-                desc_short = description[:MAX_DESCRIPTION_LENGTH] + "..." if len(description) > MAX_DESCRIPTION_LENGTH else description
-                formatted_results.append(f"\n\n**Product Description:** {desc_short}")
-            if markdown_content:
+                desc_clean = ' '.join(description.split())  # Clean whitespace
+                if for_user:
+                    desc_short = desc_clean[:200] + "..." if len(desc_clean) > 200 else desc_clean
+                    formatted_results.append(f"\n\n{desc_short}")
+                else:
+                    desc_short = desc_clean[:MAX_DESCRIPTION_LENGTH] + "..." if len(desc_clean) > MAX_DESCRIPTION_LENGTH else desc_clean
+                    formatted_results.append(f"\n\n**Product Description:** {desc_short}")
+            
+            # Markdown content (only for agent)
+            if not for_user and markdown_content:
                 markdown_short = markdown_content[:MAX_MARKDOWN_LENGTH] + "..." if len(markdown_content) > MAX_MARKDOWN_LENGTH else markdown_content
                 formatted_results.append(f"\n\n**Raw Markdown Content:** {markdown_short}")
-            formatted_results.append(f"\n\n**Link:** [{url}]({url})")
-            formatted_results.append(f"\n\n**Source:** {source_site}")
+            
+            # Create tracked URL with UTM parameters
+            tracked_url = create_tracked_url(
+                url=url,
+                source=source_site,
+                source_type="product",
+                product_name=name,
+            )
+            
+            if for_user:
+                formatted_results.append(f"\n\n[View Product →]({tracked_url})")
+                formatted_results.append("\n\n---")
+            else:
+                formatted_results.append(f"\n\n**Link:** [View Product]({tracked_url})")
+                formatted_results.append(f"\n\n**Source:** {source_site}")
             formatted_results.append("")
+        
+        # Add footer for user
+        if for_user:
+            formatted_results.append("\n*Looking for something else? Try a specific brand, price range, or product type!*")
+        
+        logger.info(f"⏱️ Formatting: {time.time() - format_start:.2f}s ({(time.time() - format_start)*1000:.0f}ms)")
+        logger.info(f"⏱️ Total search: {time.time() - total_start:.2f}s ({(time.time() - total_start)*1000:.0f}ms)")
 
         return "\n".join(formatted_results)
 
@@ -850,7 +1108,7 @@ def get_product_finding_instructions() -> str:
         
         ## SELECTION PROCESS
         
-        The search will return ~25 candidate products ranked by relevance. 
+        The search will return ~{RERANK_TOP_N} candidate products ranked by relevance. 
         YOUR JOB: Select and present only the TOP {PROMPT_TOP_N} BEST matches to the user.
         
         When selecting, prioritize:
@@ -877,7 +1135,7 @@ def get_product_finding_instructions() -> str:
         ## STEPS TO FOLLOW
         
         1. Search the product knowledge base for matching products
-        2. ANALYZE the ~25 results and mentally rank them
+        2. ANALYZE the ~{RERANK_TOP_N} results and mentally rank them
         3. SELECT the TOP {PROMPT_TOP_N} best matches (not just the first 10!)
         4. Present these {PROMPT_TOP_N} products with images and details
         5. Ask a follow-up question
@@ -906,6 +1164,7 @@ def get_product_finding_instructions() -> str:
         - REMOVE sizing info from names (e.g., "- XS", "Size Large")
         - Add 🍁 to the header if Made in Canada
         - Use --- between products for visual separation
+        - **NEVER show raw URLs** - always use [View Product](url) or [Shop Now](url)
         
         ## PRODUCT NAME HEADERS
         
@@ -944,6 +1203,21 @@ def get_product_finding_instructions() -> str:
         Image URL fix: If URL has double domain like "https://www.kamik.com//www.kamik.com/...", 
         remove the duplicate.
         
+        ## LINK FORMATTING
+        
+        ⚠️ NEVER display raw URLs to users! Always use friendly link text:
+        
+        ✅ GOOD:
+        - **Link:** [View Product](url)
+        - **Link:** [Shop Now](url)
+        - **Link:** [Buy on Roots](url)
+        
+        ❌ BAD:
+        - **Link:** https://www.roots.com/ca/en/some-product.html
+        - **Link:** [https://www.roots.com/...](url)
+        
+        The URLs in the search results are tracking links - use them as-is but with friendly text.
+        
         ## KEY REMINDERS
         
         - Select the BEST {PROMPT_TOP_N}, not just the first 10
@@ -971,12 +1245,11 @@ def get_llm_model():
         raise ValueError(f"Unsupported LLM provider: {AGENT_LLM_PROVIDER}")
 
 
-@st.cache_resource
-def get_agent_team():
-    """Get the product finder agent"""
+def _create_agent():
+    """Create a new agent instance (internal helper)"""
     logger.info(f"🤖 Initializing agent with {AGENT_LLM_PROVIDER}/{AGENT_MODEL_ID}")
     
-    product_finder_agent = Agent(
+    return Agent(
         name="Made in Canada Product Finder",
         role="Find and recommend Canadian products",
         model=get_llm_model(),
@@ -995,7 +1268,21 @@ def get_agent_team():
         num_history_runs=NUM_HISTORY_RUNS,
     )
 
-    return product_finder_agent
+
+@st.cache_resource
+def get_agent_team():
+    """Get the product finder agent (Streamlit cached version)"""
+    return _create_agent()
+
+
+def get_agent_team_no_cache():
+    """
+    Get the product finder agent (no caching - for backend API use).
+    
+    Use this when running outside of Streamlit (e.g., FastAPI backend).
+    The backend should cache the agent instance itself.
+    """
+    return _create_agent()
 
 
 async def main():

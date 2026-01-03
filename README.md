@@ -1,255 +1,221 @@
-# made-in-canada
-Repo for building a chat based shopping experience for canadian made products.
+# 🍁 Made in Canada
+
+A chat-based shopping experience for Canadian-made products.
+
+## Quick Start
+
+### 1. Install Dependencies
+
+```sh
+uv sync
+uv run playwright install firefox
+```
+
+### 2. Set Up Environment
+
+Create a `.env` file:
+```sh
+# Database
+POSTGRES_HOST=localhost
+POSTGRES_DB=madeinca
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=your_password
+
+# API Keys
+OPENAI_API_KEY=sk-...
+COHERE_API_KEY=...
+
+# Click Tracking
+TRACKING_ENABLED=true
+TRACKING_BASE_URL=http://localhost:8000
+ENVIRONMENT=development  # Set to "production" in prod
+```
+
+### 3. Run the App
+
+**Terminal 1 - Backend API:**
+```sh
+uv run uvicorn backend:app --port 8000 --reload
+```
+
+**Terminal 2 - Streamlit Frontend:**
+```sh
+uv run streamlit run app.py
+```
+
+---
 
 ## Scraping Products
+
+### Run All Scrapers
+
 ```sh
-source .venv/bin/activate
+uv run python run_scrapes.py
+```
 
-# roots ✅
-python scrape_products.py \
-  --base https://www.roots.com \
-  --use-browser \
-  --max-categories 1000 \
-  --url-regex='\.html' \
-  --use-postgres
+This runs all configured brand scrapers in parallel (default: 2 concurrent). See `run_scrapes.py` for the full list of brands.
 
-# province of canada ✅
-python scrape_products.py \
+**Options:**
+```sh
+# Adjust parallelism
+SCRAPE_MAX_PARALLEL=3 uv run python run_scrapes.py
+
+# Add cooldown between job starts
+SCRAPE_COOLDOWN_S=2.0 uv run python run_scrapes.py
+```
+
+### Scrape Individual Brands
+
+```sh
+# Shopify stores
+uv run python scrape_products.py \
   --base https://provinceofcanada.com \
   --use-browser \
   --store-type shopify \
-  --max-categories 1000 \
   --use-postgres
 
-# manmade ✅
-python scrape_products.py \
-  --base https://manmadebrand.com/ \
+# Non-Shopify (e.g., Roots)
+uv run python scrape_products.py \
+  --base https://www.roots.com \
+  --store-type roots \
   --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
+  --url-regex='\.html' \
   --use-postgres
-
-# tilley ✅
-python scrape_products.py \
-  --base https://ca.tilley.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# tentree ✅
-python scrape_products.py \
-  --base https://www.tentree.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# kamik ✅
-python scrape_products.py \
-  --base https://www.kamik.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 2 \
-  --use-postgres
-
-# sheertex ✅
-python scrape_products.py \
-  --base https://sheertex.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# baffin ✅
-python scrape_products.py \
-  --base https://www.baffin.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# # ecobee ❌ - not working
-# python scrape_products.py \
-#   --base https://www.ecobee.com/ \
-#   --use-browser \
-#   --store-type shopify \
-#   --max-categories 1000 \
-# #   --use-postgres
-
-# bushbalm ✅
-python scrape_products.py \
-  --base https://bushbalm.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# soma chocolate ✅
-python scrape_products.py \
-  --base https://www.somachocolate.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# stanfields ✅
-python scrape_products.py \
-  --base https://www.stanfields.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# balzacs ✅
-python scrape_products.py \
-  --base https://balzacs.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# muttonhead ✅
-python scrape_products.py \
-  --base https://muttonheadstore.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# naked and famous ✅
-python scrape_products.py \
-  --base https://nakedandfamousdenim.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# regimen lab ✅
-python scrape_products.py \
-  --base https://regimenlab.ca/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# lacanadienne ❌ - not working 
-# python scrape_products.py \
-#   --base https://lacanadienneshoes.com/ \
-#   --use-browser \
-#   --store-type shopify \
-#   --max-categories 1000 \
-# #   --use-postgres
-
-# craigs cookies ✅
-python scrape_products.py \
-  --base https://craigscookies.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# jenny bird ✅
-python scrape_products.py \
-  --base https://jenny-bird.ca/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# green beaver ✅
-python scrape_products.py \
-  --base https://greenbeaver.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# manitobah mucklucks ✅
-python scrape_products.py \
-  --base https://www.manitobah.ca/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# moose knuckles ✅
-python scrape_products.py \
-  --base https://www.mooseknucklescanada.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# reo thompson candies ✅
-python scrape_products.py \
-  --base https://rheothompson.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# davids tea ✅
-python scrape_products.py \
-  --base https://davidstea.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# rocky mountain soap company ✅
-python scrape_products.py \
-  --base https://www.rockymountainsoap.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# kicking horse coffee ✅
-python scrape_products.py \
-  --base https://kickinghorsecoffee.ca/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# st viateur ✅
-python scrape_products.py \
-  --base https://stviateurbagel.com/ \
-  --use-browser \
-  --store-type shopify \
-  --max-categories 1000 \
-  --use-postgres
-
-# # skiis and bikes (maybe - reseller)
-# python scrape_products.py \
-#   --base https://skiisandbiikes.com/ \
-#   --use-browser \
-#   --store-type shopify \
-#   --max-categories 1000 \
-# #   --use-postgres
-
-# Brands
-# TODO: Canada Goose
-# TODO: Lululemon
-# TODO: Mejuri
-# TODO: Grohmann Knives
-# TODO: Aritzia
-# TODO: Kotn
-# TODO: Herschel
-# TODO: Joe Fresh
-# TODO: purdy's chocolatier
-
-# Re-sellers (maybe)
-# TODO: Canadian Tire
-# TODO: Sport Chek
-# TODO: Mountain Equipment Co-op
-# TODO: Simons
 ```
 
-## Running the App
+### Scrape MadeInCA Directory
+
 ```sh
-source .venv/bin/activate
-export OPENAI_API_KEY=...
+uv run python scrape_madeinca.py --use-postgres --max-categories 100
+```
+
+### Supported Brands
+
+| Brand | Status | Type |
+|-------|--------|------|
+| Roots | ✅ | Custom |
+| Province of Canada | ✅ | Shopify |
+| Manmade | ✅ | Shopify |
+| Tilley | ✅ | Shopify |
+| Tentree | ✅ | Shopify |
+| Kamik | ✅ | Shopify |
+| Sheertex | ✅ | Shopify |
+| Baffin | ✅ | Shopify |
+| Bushbalm | ✅ | Shopify |
+| Soma Chocolate | ✅ | Shopify |
+| Stanfield's | ✅ | Shopify |
+| Balzac's | ✅ | Shopify |
+| Muttonhead | ✅ | Shopify |
+| Naked and Famous | ✅ | Shopify |
+| Regimen Lab | ✅ | Shopify |
+| Craig's Cookies | ✅ | Shopify |
+| Jenny Bird | ✅ | Shopify |
+| Green Beaver | ✅ | Shopify |
+| Manitobah | ✅ | Shopify |
+| Moose Knuckles | ✅ | Shopify |
+| Rheo Thompson | ✅ | Shopify |
+| David's Tea | ✅ | Shopify |
+| Rocky Mountain Soap | ✅ | Shopify |
+| Kicking Horse Coffee | ✅ | Shopify |
+| St-Viateur Bagel | ✅ | Shopify |
+
+**TODO: - brands to add**
+- Canada Goose
+- Lululemon
+- Mejuri
+- Grohmann Knives
+- Aritzia
+- Kotn
+- Herschel 
+- Ecobee
+- Lacanadienne
+- Joe Fresh
+- purdy's chocolatier
+
+**TODO: - re-sellers to add**
+- Canadian Tire
+- Sport Chek
+- Mountain Equipment Co-op
+- Simons
+- Skiis and Bikes
+
+---
+
+## Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   Streamlit     │────▶│   FastAPI       │────▶│   PostgreSQL    │
+│   Frontend      │     │   Backend       │     │   Database      │
+│   (app.py)      │     │   (backend.py)  │     │                 │
+│   :8501         │     │   :8000         │     │   :5432         │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+- **Frontend (Streamlit)**: Chat interface, AI agent
+- **Backend (FastAPI)**: Click tracking, UTM parameters, analytics
+- **Database (PostgreSQL)**: Products, madeinca listings, click logs
+
+---
+
+## Click Tracking
+
+All product links go through the tracking endpoint with UTM parameters:
+
+```
+/click?url=https://example.com&source=brand&product_name=Product&referrer=madeincanada.dev
+```
+
+**View click stats:**
+```sh
+# All clicks
+curl http://localhost:8000/api/clicks/stats?days=7
+
+# Production only
+curl "http://localhost:8000/api/clicks/stats?days=7&environment=production"
+```
+
+**View pageview stats:**
+```sh
+# All pageviews
+curl http://localhost:8000/api/pageviews/stats?days=7
+
+# Production only
+curl "http://localhost:8000/api/pageviews/stats?days=7&environment=production"
+```
+
+**Disable tracking:**
+```sh
+TRACKING_ENABLED=false
+```
+
+---
+
+## Production Deployment
+
+### Option A: Docker Compose (recommended)
+
+```yaml
+services:
+  backend:
+    build: .
+    command: uvicorn backend:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    env_file: .env
+    
+  frontend:
+    build: .
+    command: streamlit run app.py --server.port 8501
+    ports:
+      - "8501:8501"
+    env_file: .env
+```
+
+### Option B: Simple Script
+
+```sh
+#!/bin/bash
+uvicorn backend:app --port 8000 &
 streamlit run app.py
 ```
