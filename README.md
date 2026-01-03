@@ -2,6 +2,9 @@
 
 A chat-based shopping experience for Canadian-made products.
 
+<img width="702" height="889" alt="image" src="https://github.com/user-attachments/assets/a22d1de6-7e99-40f2-b5f9-0986f960773f" />
+
+
 ## Quick Start
 
 ### 1. Install Dependencies
