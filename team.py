@@ -262,7 +262,7 @@ AGENT_MODEL_ID = config("AGENT_MODEL_ID", default="gpt-5-nano")
 # Knowledge Base Configuration
 EMBEDDING_MODEL = "embed-v4.0"
 EMBEDDING_DIMENSIONS = 1536
-RERANK_MODEL = "rerank-v3.5"
+RERANK_MODEL = "rerank-v4.0-pro"
 
 # Funnel: SQL_CANDIDATES → dedupe → INITIAL_SEARCH_LIMIT → rerank → PROMPT_TOP_N
 SQL_CANDIDATES = 250  # Raw candidates from SQL (before dedupe)
@@ -529,40 +529,45 @@ async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N, p
         made_in_canada = row[13] if len(row) > 13 else None
         made_in_canada_reason = row[14] if len(row) > 14 else None
         
-        doc_text = f"Product Name: {name or ''} | Brand Name: {brand or ''}"
-        if description:
-            doc_text += f" | Description: {description[:MAX_DESCRIPTION_LENGTH]}"
-        if markdown:
-            doc_text += f" | Markdown Content: {markdown[:MAX_MARKDOWN_LENGTH]}"
+        doc_text = f"Product Name: {name or ''} \n\nBrand Name: {brand or ''}"
         if price:
-            doc_text += f" | Price: {price} {currency or ''}"
+            doc_text += f"\n\nPrice: {price} {currency or ''}"
         # Add Made in Canada status and reason - emphasize this more
         if made_in_canada is True:
-            doc_text += " | MADE IN CANADA: YES - VERIFIED CANADIAN MANUFACTURED"
+            doc_text += "\n\nMADE IN CANADA: YES - VERIFIED CANADIAN MANUFACTURED"
             if made_in_canada_reason:
-                doc_text += f" (Reason: {made_in_canada_reason})"
+                doc_text += f"\n\n(Reason: {made_in_canada_reason})"
         elif made_in_canada is False:
-            doc_text += " | Made in Canada: NO - NOT CANADIAN MADE"
+            doc_text += "\n\nMade in Canada: NO - NOT CANADIAN MADE"
             if made_in_canada_reason:
-                doc_text += f" (Reason: {made_in_canada_reason})"
+                doc_text += f"\n\n(Reason: {made_in_canada_reason})"
         else:
-            doc_text += " | Made in Canada: UNKNOWN - UNVERIFIED"
+            doc_text += "\n\nMade in Canada: UNKNOWN - UNVERIFIED"
         
         # Add reviews info for reranker using SMOOTHED rating for ranking
-        # This prevents products with 5 stars and 1 review from dominating
         smoothed_rating = smooth_rating_for_ranking(average_rating, num_reviews)
         review_count = num_reviews or 0
         
-        # Simple format: Trust Score based on smoothed rating + review count
-        # Higher score = better quality signal
-        trust_score = smoothed_rating * min(1.0, review_count / 20)  # Scale by review count up to 20
-        doc_text += f" | Quality Score: {trust_score:.1f}/5 ({review_count} reviews)"
+        if review_count == 0:
+            doc_text += f"\n\nQuality Score: N/A (No reviews)"
+        else:
+            doc_text += f"\n\nQuality Score: {smoothed_rating:.1f}/5 ({review_count} reviews)"
+
+        if description:
+            doc_text += f"\n\nDescription: {description[:MAX_DESCRIPTION_LENGTH]}"
+        # if markdown:
+        #     doc_text += f"\n\nMarkdown Content: {markdown[:MAX_MARKDOWN_LENGTH]}"
+        
         
         logger.debug(f"Document text: {doc_text}")
         documents.append(doc_text)
     
     try:
         cohere_client = cohere.AsyncClientV2(api_key=config("COHERE_API_KEY"))
+
+        logger.info(f"Query to re-ranker: {rerank_query}")a
+        logger.info(f"Sample document for re-ranker: {documents[0]}")
+
         rerank_response = await cohere_client.rerank(
             model=RERANK_MODEL,
             query=rerank_query,
@@ -577,23 +582,6 @@ async def rerank_results(query: str, results: list, top_n: int = RERANK_TOP_N, p
             rerank_score = result.relevance_score
             # Append rerank_score to the tuple
             reranked_results.append((*results[original_idx], rerank_score))
-        
-        # If prioritizing Made in Canada, sort them to the top
-        if prioritize_made_in_canada:
-            # Sort by: (1) made_in_canada=True first, then (2) rerank_score descending
-            # made_in_canada is at index 13
-            def sort_key(row):
-                made_in_canada = row[13] if len(row) > 13 else None
-                rerank_score = row[-1] if row[-1] is not None else 0
-                # Return tuple: (not made_in_canada, -rerank_score)
-                # This puts True first (since not True = False < not False = True)
-                return (made_in_canada is not True, -rerank_score)
-            
-            reranked_results.sort(key=sort_key)
-            
-            # Count how many Made in Canada products we have
-            mic_count = sum(1 for r in reranked_results if r[13] is True)
-            logger.info(f"🍁 Found {mic_count} Made in Canada products out of {len(reranked_results)}")
         
         # Limit to top_n after sorting
         reranked_results = reranked_results[:top_n]
@@ -679,7 +667,7 @@ async def search_products(query: str, limit: int = RERANK_TOP_N, for_user: bool 
 
         results = []
         db_start = time.time()
-        async with await psycopg.AsyncConnection.connect(conn_string) as conn:
+        async with await psycopg.AsyncConnection.connect(conn_string, autocommit=True) as conn:
             async with conn.cursor() as cur:
                 # Notes:
                 # - Vector candidates: fastest with ivfflat index on embedding
