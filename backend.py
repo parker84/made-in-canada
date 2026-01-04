@@ -25,11 +25,17 @@ from decouple import config
 
 # Optional: PostgreSQL for persistent storage
 psycopg_available = False
+pool_available = False
 try:
     import psycopg
     psycopg_available = True
+    from psycopg_pool import AsyncConnectionPool
+    pool_available = True
 except ImportError:
     pass
+
+# Global connection pool (initialized on startup)
+db_pool: Optional["AsyncConnectionPool"] = None
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -71,6 +77,29 @@ app.add_middleware(
 def get_db_connection_string() -> str:
     """Build PostgreSQL connection string"""
     return f"host={DB_CONFIG['host']} dbname={DB_CONFIG['dbname']} user={DB_CONFIG['user']} password={DB_CONFIG['password']}"
+
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def get_db_connection():
+    """
+    Get a database connection from the pool (or create a new one if pool unavailable).
+    Usage: async with get_db_connection() as conn:
+    """
+    global db_pool
+    
+    if db_pool:
+        # Use pooled connection
+        async with db_pool.connection() as conn:
+            yield conn
+    else:
+        # Fallback to direct connection
+        async with await psycopg.AsyncConnection.connect(
+            get_db_connection_string(), 
+            autocommit=True
+        ) as conn:
+            yield conn
 
 
 async def init_click_tracking_table():
@@ -194,10 +223,36 @@ async def init_feedback_table():
 
 @app.on_event("startup")
 async def startup():
-    """Initialize database on startup"""
+    """Initialize database and connection pool on startup"""
+    global db_pool
+    
+    # Initialize connection pool
+    if pool_available:
+        try:
+            db_pool = AsyncConnectionPool(
+                conninfo=get_db_connection_string(),
+                min_size=2,   # Keep 2 connections ready
+                max_size=10,  # Max 10 concurrent connections
+                open=False,   # Don't open yet
+            )
+            await db_pool.open()
+            log.info("✅ Database connection pool initialized (2-10 connections)")
+        except Exception as e:
+            log.error(f"❌ Failed to initialize connection pool: {e}")
+            db_pool = None
+    
     await init_click_tracking_table()
     await init_pageview_tracking_table()
     await init_feedback_table()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Close connection pool on shutdown"""
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+        log.info("✅ Database connection pool closed")
 
 
 def add_utm_params(url: str, extra_params: Optional[dict] = None) -> str:
@@ -260,7 +315,7 @@ async def log_click(
         return
     
     try:
-        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+        async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
                     INSERT INTO link_clicks 
@@ -283,7 +338,6 @@ async def log_click(
                     ENVIRONMENT,
                     datetime.now(),
                 ))
-                await conn.commit()
     except Exception as e:
         log.error(f"❌ Failed to log click: {e}")
 
@@ -360,7 +414,7 @@ async def get_click_stats(
         return JSONResponse({"error": "Database not available"}, status_code=503)
     
     try:
-        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+        async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 # Build WHERE clause dynamically
                 where_clauses = ["clicked_at > NOW() - INTERVAL '%s days'"]
@@ -460,7 +514,7 @@ async def log_pageview(
         return
     
     try:
-        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+        async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
                     INSERT INTO pageviews 
@@ -477,7 +531,6 @@ async def log_pageview(
                     json.dumps(metadata) if metadata else None,
                     datetime.now(),
                 ))
-                await conn.commit()
     except Exception as e:
         log.error(f"❌ Failed to log pageview: {e}")
 
@@ -518,7 +571,7 @@ async def get_pageview_stats(
         return JSONResponse({"error": "Database not available"}, status_code=503)
     
     try:
-        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+        async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 # Build WHERE clause dynamically
                 where_clauses = ["viewed_at > NOW() - INTERVAL '%s days'"]
@@ -639,7 +692,7 @@ async def log_feedback(
         return
     
     try:
-        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+        async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
                     INSERT INTO feedback 
@@ -656,7 +709,6 @@ async def log_feedback(
                     ENVIRONMENT,
                     datetime.now(),
                 ))
-                await conn.commit()
     except Exception as e:
         log.error(f"❌ Failed to log feedback: {e}")
 
@@ -696,7 +748,7 @@ async def get_feedback_stats(
         return JSONResponse({"error": "Database not available"}, status_code=503)
     
     try:
-        async with await psycopg.AsyncConnection.connect(get_db_connection_string()) as conn:
+        async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 # Build WHERE clause dynamically
                 where_clauses = ["created_at > NOW() - INTERVAL '%s days'"]
@@ -1104,16 +1156,9 @@ async def search_products_api(request: SearchRequest):
         embedding = await generate_embedding(parsed.intent)
         embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
         
-        conn_string = (
-            f"host={DB_CONFIG['host']} "
-            f"dbname={DB_CONFIG['dbname']} "
-            f"user={DB_CONFIG['user']} "
-            f"password={DB_CONFIG['password']}"
-        )
-        
         mic_filter = "AND p.made_in_canada = true" if request.made_in_canada_only else ""
         
-        async with await psycopg.AsyncConnection.connect(conn_string) as conn:
+        async with get_db_connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(f"""
                     --sql
